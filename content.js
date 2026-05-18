@@ -4,21 +4,12 @@
   }
 
   // Only run in the relevant Ariba frame
-  const expansionButtons = document.querySelectorAll('.material-icons.expansion-button');
+  const expansionButtons = document.querySelectorAll('[aria-label="expand"]');
   const supplierElement = document.querySelector('.supplier-name');
   const fileAnchors = document.querySelectorAll('.file-name-container a.file-name');
   if (expansionButtons.length === 0 && !supplierElement && fileAnchors.length === 0) return;
 
   sendStatus('Found Ariba content. Processing...');
-
-  // Read config — gracefully handle iframe storage restrictions
-  let notebooklmConfig = null;
-  try {
-    const r = await chrome.storage.session.get('notebooklmConfig');
-    notebooklmConfig = r.notebooklmConfig || null;
-  } catch (e) {
-    console.warn('[Ariba Ext] Session storage unavailable in this frame:', e.message);
-  }
 
   let supplierName = 'Unknown Supplier';
   if (supplierElement) {
@@ -35,8 +26,8 @@
       ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
         btn.dispatchEvent(new MouseEvent(type, { view: window, bubbles: true, cancelable: true, buttons: 1 }));
       });
-      try { btn.click(); } catch (e) {}
-      try { if (btn.parentElement) btn.parentElement.click(); } catch (e) {}
+      try { btn.click(); } catch (e) { }
+      try { if (btn.parentElement) btn.parentElement.click(); } catch (e) { }
       await new Promise(r => setTimeout(r, 500));
     }
   }
@@ -63,32 +54,6 @@
   });
 
   // Step 3: Send to background for disk download
-  chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, files, notebooklmConfig });
-
-  // Step 4: Screenshot (always notify background when done, even on failure)
-  sendStatus('Capturing screenshot...');
-  let screenshotDataUrl = null;
-  try {
-    await new Promise(r => setTimeout(r, 1500));
-    if (typeof html2canvas !== 'undefined') {
-      const canvas = await html2canvas(document.body, {
-        useCORS: true, allowTaint: true,
-        scale: window.devicePixelRatio > 1 ? 1 : window.devicePixelRatio,
-        scrollY: -window.scrollY
-      });
-      screenshotDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-    }
-  } catch (e) {
-    console.warn('[Ariba Ext] Screenshot failed:', e.message);
-  }
-
-  // Always notify background — this is what triggers the NotebookLM flow
-  chrome.runtime.sendMessage({
-    action: 'downloadScreenshot',
-    supplierName,
-    dataUrl: screenshotDataUrl, // may be null if screenshot failed
-    notebooklmConfig
-  });
-
-  sendStatus(screenshotDataUrl ? 'Screenshot captured!' : 'Files downloaded (screenshot skipped).');
+  chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, files });
+  sendStatus('Files sent for download. Done!', false, true);
 })();

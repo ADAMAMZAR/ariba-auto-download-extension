@@ -48,6 +48,24 @@ button:disabled {
   cursor: not-allowed;
 }
 
+.btn-secondary {
+  background-color: transparent;
+  color: #1a73e8;
+  border: 1.5px solid #1a73e8;
+  margin-top: 4px;
+}
+
+.btn-secondary:hover {
+  background-color: #e8f0fe;
+}
+
+.btn-secondary:disabled {
+  background-color: transparent;
+  color: #a8c7fa;
+  border-color: #a8c7fa;
+  cursor: not-allowed;
+}
+
 .status {
   font-size: 12px;
   color: #137333;

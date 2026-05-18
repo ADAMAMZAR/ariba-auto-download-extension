@@ -18,46 +18,27 @@ function notifyPanel(text, error = false, done = false) {
 
 function cleanName(n) { return n.replace(/[\/\\?%*:|"<>]/g, '-'); }
 
-function arrayBufferToBase64(buf) {
-  let bin = '';
-  const bytes = new Uint8Array(buf);
-  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
-}
-
-function guessMime(name) {
-  if (name.endsWith('.pdf')) return 'application/pdf';
-  if (name.endsWith('.docx')) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-  if (name.endsWith('.xlsx')) return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
-  if (name.endsWith('.png')) return 'image/png';
-  return 'application/octet-stream';
-}
-
 // -----------------------------------------------------------------------
-// Persistent state via chrome.storage.session (survives service worker sleep)
+// Persistent state via chrome.storage.session
 // -----------------------------------------------------------------------
 async function getState(supplier) {
   const key = `pending_${supplier}`;
   const r = await chrome.storage.session.get(key);
-  return r[key] || { files: [], screenshotDone: false, filesDone: false, screenshotDataUrl: null, config: null };
+  return r[key] || { filesDone: false, config: null };
 }
-
 async function setState(supplier, data) {
   await chrome.storage.session.set({ [`pending_${supplier}`]: data });
 }
-
 async function clearState(supplier) {
   await chrome.storage.session.remove(`pending_${supplier}`);
 }
 
 // -----------------------------------------------------------------------
-// Trigger NotebookLM once both files + screenshot messages are received
+// Open NotebookLM once downloads are done, then interact with the checkbox
 // -----------------------------------------------------------------------
-async function maybeUploadToNotebookLM(supplier) {
+async function maybeOpenNotebookLM(supplier) {
   const state = await getState(supplier);
-  if (!state.filesDone || !state.screenshotDone) return;
-
+  if (!state.filesDone) return;
   await clearState(supplier);
 
   if (!state.config?.connectToNotebooklm) {
@@ -65,48 +46,55 @@ async function maybeUploadToNotebookLM(supplier) {
     return;
   }
 
-  notifyPanel('Re-fetching files for NotebookLM...');
-
-  const payloads = [];
-  for (const file of state.files) {
-    try {
-      const resp = await fetch(file.url, { credentials: 'include' });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const base64 = arrayBufferToBase64(await resp.arrayBuffer());
-      const mime = resp.headers.get('content-type') || guessMime(file.filename);
-      payloads.push({ name: file.filename, base64, mime });
-    } catch (e) {
-      console.warn('Could not fetch:', file.filename, e.message);
-    }
-  }
-
-  // Include screenshot if captured
-  if (state.screenshotDataUrl) {
-    payloads.push({
-      name: `${supplier} - screenshot.jpg`,
-      base64: state.screenshotDataUrl.split(',')[1],
-      mime: 'image/jpeg'
-    });
-  }
-
-  if (!payloads.length) {
-    notifyPanel('No files could be fetched for NotebookLM.', true, true);
-    return;
-  }
-
-  await chrome.storage.session.set({ notebooklmPayload: payloads });
-  notifyPanel(`Opening NotebookLM with ${payloads.length} file(s)...`);
-
+  notifyPanel('Opening NotebookLM...');
   const tab = await chrome.tabs.create({ url: state.config.notebooklmUrl });
 
+  // Wait for the page to fully load, then inject the checkbox script
   chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
     if (tabId !== tab.id || info.status !== 'complete') return;
     chrome.tabs.onUpdated.removeListener(listener);
-    chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['notebooklm_uploader.js'] }, () => {
+
+    chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async () => {
+        const wait = ms => new Promise(r => setTimeout(r, ms));
+
+        // Poll for the checkbox — Angular/Material may take a moment to render
+        let nativeInput = null;
+        for (let i = 0; i < 40; i++) {          // up to 10 seconds
+          nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
+          if (nativeInput) break;
+          await wait(250);
+        }
+
+        if (!nativeInput) {
+          console.error('[Ariba Ext] Checkbox #mat-mdc-checkbox-0-input not found.');
+          return;
+        }
+
+        const isChecked = nativeInput.checked;
+        console.log('[Ariba Ext] Checkbox state:', isChecked);
+
+        if (isChecked) {
+          // Already checked → click once
+          nativeInput.click();
+          console.log('[Ariba Ext] Was checked — clicked once.');
+        } else {
+          // Unchecked → click twice with buffer so Angular registers each change
+          nativeInput.click();
+          console.log('[Ariba Ext] Was unchecked — first click done. Waiting...');
+          await wait(600);
+          nativeInput.click();
+          console.log('[Ariba Ext] Second click done.');
+        }
+      }
+    }, () => {
       if (chrome.runtime.lastError) {
-        notifyPanel('Failed to inject uploader: ' + chrome.runtime.lastError.message, true, true);
+        notifyPanel('Checkbox script error: ' + chrome.runtime.lastError.message, true);
       }
     });
+
+    notifyPanel('NotebookLM opened. All done!', false, true);
   });
 }
 
@@ -115,37 +103,24 @@ async function maybeUploadToNotebookLM(supplier) {
 // -----------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   (async () => {
+
     if (request.action === 'downloadFiles') {
       const s = cleanName(request.supplierName || 'Ariba');
       for (const file of (request.files || [])) {
-        const clean = cleanName(file.filename);
-        chrome.downloads.download({ url: file.url, filename: `${s}/${s} - ${clean}`, saveAs: false });
+        chrome.downloads.download({
+          url: file.url,
+          filename: `${s}/${s} - ${cleanName(file.filename)}`,
+          saveAs: false
+        });
       }
-      // Read config directly from session storage — content.js runs in an iframe
-      // and cannot access chrome.storage.session, so we never rely on request.notebooklmConfig
       const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
       const state = await getState(s);
-      state.files = (request.files || []).map(f => ({ url: f.url, filename: cleanName(f.filename) }));
       state.config = notebooklmConfig || null;
       state.filesDone = true;
       await setState(s, state);
-      await maybeUploadToNotebookLM(s);
+      await maybeOpenNotebookLM(s);
     }
 
-    if (request.action === 'downloadScreenshot') {
-      const s = cleanName(request.supplierName || 'Ariba');
-      if (request.dataUrl) {
-        chrome.downloads.download({ url: request.dataUrl, filename: `${s}/${s} - screenshot.jpg`, saveAs: false });
-      }
-      // Same fix — read config from session storage directly
-      const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
-      const state = await getState(s);
-      state.screenshotDataUrl = request.dataUrl || null;
-      state.screenshotDone = true;
-      if (!state.config) state.config = notebooklmConfig || null;
-      await setState(s, state);
-      await maybeUploadToNotebookLM(s);
-    }
   })();
-  return true; // keep message channel open for async
+  return true;
 });

@@ -1,9 +1,10 @@
 document.addEventListener('DOMContentLoaded', () => {
-  const downloadBtn = document.getElementById('download-btn');
-  const connectCheckbox = document.getElementById('connect-notebooklm');
-  const notebooklmContainer = document.getElementById('notebooklm-container');
-  const notebooklmUrlInput = document.getElementById('notebooklm-url');
-  const logEntries = document.getElementById('log-entries');
+  const downloadBtn          = document.getElementById('download-btn');
+  const screenshotBtn        = document.getElementById('screenshot-btn');
+  const connectCheckbox      = document.getElementById('connect-notebooklm');
+  const notebooklmContainer  = document.getElementById('notebooklm-container');
+  const notebooklmUrlInput   = document.getElementById('notebooklm-url');
+  const logEntries           = document.getElementById('log-entries');
 
   function addLog(text, type = 'info') {
     const el = document.createElement('div');
@@ -27,7 +28,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   downloadBtn.addEventListener('click', async () => {
-    logEntries.innerHTML = ''; // clear log on new run
+    logEntries.innerHTML = '';
     downloadBtn.disabled = true;
     addLog('Starting extraction...', 'info');
 
@@ -41,19 +42,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     try {
-      // Find specifically an Ariba tab by URL
       const aribaTabs = await chrome.tabs.query({ url: '*://*.ariba.com/*' });
-
       if (!aribaTabs.length) {
-        addLog('No Ariba tab found. Please open the Ariba supplier page first, then try again.', 'error');
+        addLog('No Ariba tab found. Please open the Ariba supplier page first.', 'error');
         downloadBtn.disabled = false;
         return;
       }
 
-      // Use the most recently accessed Ariba tab
       const aribaTab = aribaTabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
       addLog(`Found Ariba tab: ${aribaTab.title || aribaTab.url}`, 'info');
-
 
       await chrome.storage.session.set({
         notebooklmConfig: { connectToNotebooklm, notebooklmUrl }
@@ -61,7 +58,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
-        files: ['html2canvas.min.js', 'content.js']
+        files: ['content.js']
       });
 
     } catch (err) {
@@ -70,7 +67,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Listen for status messages from content/background
+  // Screenshot button — placeholder, no functionality yet
+  screenshotBtn.addEventListener('click', () => {
+    addLog('Screenshot feature coming soon.', 'info');
+  });
+
+  // Listen for status messages from content / background
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'status') {
       const type = message.error ? 'error' : (message.done ? 'done' : 'info');
