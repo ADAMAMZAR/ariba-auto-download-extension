@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ariba Auto Download</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <h2>Ariba Auto Download</h2>
+    <p class="description">Expands all sections and downloads all attachments into the supplier's folder.</p>
+
+    <button id="download-btn">Download Attachments</button>
+    
+    <div class="checkbox-group">
+      <input type="checkbox" id="connect-notebooklm" />
+      <label for="connect-notebooklm">Connect to NotebookLM</label>
+    </div>
+
+    <div id="notebooklm-container" style="display: none;">
+      <div class="input-group">
+        <label for="notebooklm-url">NotebookLM Notebook URL</label>
+        <input type="url" id="notebooklm-url" placeholder="https://notebooklm.google.com/notebook/..." />
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
