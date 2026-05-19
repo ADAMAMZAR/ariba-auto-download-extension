@@ -14,7 +14,8 @@
   ],
   "host_permissions": [
     "*://*.ariba.com/*",
-    "https://notebooklm.google.com/*"
+    "https://notebooklm.google.com/*",
+    "https://gist.githubusercontent.com/*"
   ],
   "action": {},
   "background": {

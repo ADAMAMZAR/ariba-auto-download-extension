@@ -107,7 +107,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 
   } catch (err) {
     // Always detach on error to release the tab
-    chrome.debugger.detach(target, () => {});
+    chrome.debugger.detach(target, () => { });
     notifyPanel('Screenshot error: ' + err.message, true);
   }
 }
@@ -116,7 +116,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 // Helpers
 // -----------------------------------------------------------------------
 function notifyPanel(text, error = false, done = false) {
-  chrome.runtime.sendMessage({ type: 'status', text, error, done }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'status', text, error, done }).catch(() => { });
 }
 
 function cleanName(n) { return n.replace(/[\/\\?%*:|"<>]/g, '-'); }
@@ -149,18 +149,104 @@ async function maybeOpenNotebookLM(supplier) {
     return;
   }
 
+  // Fetch the latest system instructions from Gist
+  notifyPanel('Fetching latest system instructions...');
+  let gistText = '';
+  try {
+    const gistResponse = await fetch('https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1bedfe76caf59f3/raw/gistfile1.txt');
+    if (gistResponse.ok) {
+      gistText = await gistResponse.text();
+    } else {
+      console.warn('[Ariba Ext] Failed to fetch gist text. Status:', gistResponse.status);
+    }
+  } catch (err) {
+    console.error('[Ariba Ext] Error fetching gist:', err);
+  }
+
   notifyPanel('Opening NotebookLM...');
   const tab = await chrome.tabs.create({ url: state.config.notebooklmUrl });
 
-  // Wait for the page to fully load, then inject the checkbox script
+  // Wait for the page to fully load, then inject the checkbox and sync script
   chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
     if (tabId !== tab.id || info.status !== 'complete') return;
-    chrome.tabs.onUpdated.removeListener(listener);
 
     chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: async () => {
+      world: 'MAIN',
+      func: async (instructionText) => {
         const wait = ms => new Promise(r => setTimeout(r, ms));
+        const generateReqId = () => Math.floor(Math.random() * 90000) + 10000;
+
+        const getNotebookId = () => {
+          const match = window.location.pathname.match(/\/notebook\/([a-zA-Z0-9-]+)/);
+          return match ? match[1] : null;
+        };
+
+        const notebookId = getNotebookId();
+        if (notebookId && instructionText) {
+          const syncKey = `synced_${notebookId}`;
+          if (!sessionStorage.getItem(syncKey)) {
+            console.log('[Ariba Ext] Direct system instruction sync started...');
+            const authToken = window.WIZ_global_data?.SNlM0e;
+            
+            if (authToken) {
+              try {
+                const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=s0tc2d&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20260512.10_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+
+                const payload = [
+                  notebookId,
+                  [
+                    [
+                      null, null, null, null, null, null, null,
+                      [
+                        [2, instructionText], // '2' sets to custom mode
+                        []
+                      ]
+                    ]
+                  ],
+                  [
+                    2, null, null,
+                    [
+                      1, null, null, null, null, null, null, null, null, null, [1]
+                    ]
+                  ]
+                ];
+
+                const envelope = [
+                  's0tc2d',
+                  JSON.stringify(payload),
+                  null,
+                  'generic'
+                ];
+
+                const formData = new URLSearchParams();
+                formData.set('f.req', JSON.stringify([[envelope]]));
+                formData.set('at', authToken);
+
+                const response = await fetch(url, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                  },
+                  body: formData.toString()
+                });
+
+                if (response.ok) {
+                  console.log('[Ariba Ext] System instructions successfully synced to custom!');
+                  sessionStorage.setItem(syncKey, 'true');
+                  window.location.reload();
+                  return 'reloaded';
+                } else {
+                  console.error('[Ariba Ext] Failed to update system instructions:', response.statusText);
+                }
+              } catch (err) {
+                console.error('[Ariba Ext] Error updating system instructions:', err);
+              }
+            } else {
+              console.error('[Ariba Ext] Auth token not found in WIZ_global_data.');
+            }
+          }
+        }
 
         // Poll for the checkbox — Angular/Material may take a moment to render
         let nativeInput = null;
@@ -172,7 +258,7 @@ async function maybeOpenNotebookLM(supplier) {
 
         if (!nativeInput) {
           console.error('[Ariba Ext] Checkbox #mat-mdc-checkbox-0-input not found.');
-          return;
+          return 'done';
         }
 
         const isChecked = nativeInput.checked;
@@ -190,14 +276,23 @@ async function maybeOpenNotebookLM(supplier) {
           nativeInput.click();
           console.log('[Ariba Ext] Second click done.');
         }
-      }
-    }, () => {
+
+        return 'done';
+      },
+      args: [gistText]
+    }, (results) => {
       if (chrome.runtime.lastError) {
-        notifyPanel('Checkbox script error: ' + chrome.runtime.lastError.message, true);
+        console.error('Sync/Checkbox script error: ' + chrome.runtime.lastError.message);
+        chrome.tabs.onUpdated.removeListener(listener);
+        return;
+      }
+      const result = results?.[0]?.result;
+      if (result === 'done') {
+        chrome.tabs.onUpdated.removeListener(listener);
       }
     });
 
-    notifyPanel('NotebookLM opened. All done!', false, true);
+    notifyPanel('NotebookLM opened and system instructions synced!', false, true);
   });
 }
 
