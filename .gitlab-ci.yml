@@ -1,0 +1,43 @@
+image: node:24-alpine
+
+stages:
+  - build
+  - deploy
+
+build_extension:
+  stage: build
+  script:
+    - echo "Packaging the extension..."
+    - apk add --no-cache zip
+    - zip -r extension.zip . -x "*.git*" ".gitlab-ci.yml" "node_modules/*" "extension.zip"
+  artifacts:
+    paths:
+      - extension.zip
+    expire_in: 1 week
+
+deploy_to_chrome_web_store:
+  stage: deploy
+  dependencies:
+    - build_extension
+  script:
+    - echo "Uploading to Chrome Web Store..."
+    - npm install -g chrome-webstore-upload-cli
+    # Note: The --auto-publish flag has been deprecated and removed in recent versions.
+    # To upload and publish automatically, run `chrome-webstore-upload` without the "upload" command.
+    - >
+      chrome-webstore-upload 
+      --source extension.zip 
+      --extension-id $EXTENSION_ID 
+      --client-id $CLIENT_ID 
+      --client-secret $CLIENT_SECRET 
+      --refresh-token $REFRESH_TOKEN 
+    # Alternatively, to ONLY upload as a DRAFT (recommended for safety), uncomment the lines below:
+    # - >
+    #   chrome-webstore-upload upload 
+    #   --source extension.zip 
+    #   --extension-id $EXTENSION_ID 
+    #   --client-id $CLIENT_ID 
+    #   --client-secret $CLIENT_SECRET 
+    #   --refresh-token $REFRESH_TOKEN 
+  only:
+    - main # Only run this job when changes are pushed to the main branch
