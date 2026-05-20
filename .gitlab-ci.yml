@@ -24,20 +24,7 @@ deploy_to_chrome_web_store:
     - npm install -g chrome-webstore-upload-cli
     # Note: The --auto-publish flag has been deprecated and removed in recent versions.
     # To upload and publish automatically, run `chrome-webstore-upload` without the "upload" command.
-    - >
-      chrome-webstore-upload 
-      --source extension.zip 
-      --extension-id $EXTENSION_ID 
-      --client-id $CLIENT_ID 
-      --client-secret $CLIENT_SECRET 
-      --refresh-token $REFRESH_TOKEN 
-    # Alternatively, to ONLY upload as a DRAFT (recommended for safety), uncomment the lines below:
-    # - >
-    #   chrome-webstore-upload upload 
-    #   --source extension.zip 
-    #   --extension-id $EXTENSION_ID 
-    #   --client-id $CLIENT_ID 
-    #   --client-secret $CLIENT_SECRET 
-    #   --refresh-token $REFRESH_TOKEN 
+    - chrome-webstore-upload upload --source extension.zip --extension-id $EXTENSION_ID
+    - chrome-webstore-upload publish --extension-id $EXTENSION_ID 
   only:
     - main # Only run this job when changes are pushed to the main branch
