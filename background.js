@@ -255,8 +255,6 @@ async function maybeOpenNotebookLM(supplier) {
                 if (response.ok) {
                   console.log('[Ariba Ext] System instructions successfully synced to custom!');
                   sessionStorage.setItem(syncKey, 'true');
-                  window.location.reload();
-                  return 'reloaded';
                 } else {
                   console.error('[Ariba Ext] Failed to update system instructions:', response.statusText);
                 }
@@ -269,7 +267,52 @@ async function maybeOpenNotebookLM(supplier) {
           }
         }
 
-        // Upload session files to NotebookLM via WIZ RPC and Scotty
+        // ── Step 1: Toggle the checkbox BEFORE uploading ──────────────────
+        // Poll for the checkbox — Angular/Material may take a moment to render
+        let nativeInput = null;
+        for (let i = 0; i < 40; i++) {          // up to 10 seconds
+          nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
+          if (nativeInput) break;
+          await wait(250);
+        }
+
+        if (!nativeInput) {
+          console.error('[Ariba Ext] Checkbox #mat-mdc-checkbox-0-input not found. Continuing with upload anyway.');
+        } else {
+          const isChecked = nativeInput.checked;
+          console.log('[Ariba Ext] Checkbox state:', isChecked);
+
+          if (isChecked) {
+            // Already checked → click once
+            nativeInput.click();
+            console.log('[Ariba Ext] Was checked — clicked once.');
+          } else {
+            // Unchecked → click twice with buffer so Angular registers each change
+            nativeInput.click();
+            console.log('[Ariba Ext] Was unchecked — first click done. Waiting...');
+            await wait(600);
+            nativeInput.click();
+            console.log('[Ariba Ext] Second click done.');
+          }
+
+          // Let Angular settle after checkbox state change before uploading
+          await wait(1500);
+          console.log('[Ariba Ext] Checkbox toggle done. Proceeding with file upload...');
+        }
+
+        // ── Step 1.5: Close the upload modal if it is open ────────────────
+        // NotebookLM sometimes shows an upload-from-drive modal on load;
+        // close it so it doesn't block the source panel.
+        const closeBtn = document.querySelector('button[aria-label="Close"].close-button');
+        if (closeBtn) {
+          closeBtn.click();
+          console.log('[Ariba Ext] Closed upload modal.');
+          await wait(500);
+        } else {
+          console.log('[Ariba Ext] No upload modal found, continuing...');
+        }
+
+        // ── Step 2: Upload session files to NotebookLM via WIZ RPC and Scotty ──
         if (notebookId && filesToUpload && filesToUpload.length > 0) {
           const uploadKey = `uploaded_${notebookId}`;
           if (!sessionStorage.getItem(uploadKey)) {
@@ -483,35 +526,6 @@ async function maybeOpenNotebookLM(supplier) {
               console.error('[Ariba Ext] API upload failed:', err);
             }
           }
-        }
-
-        // Poll for the checkbox — Angular/Material may take a moment to render
-        let nativeInput = null;
-        for (let i = 0; i < 40; i++) {          // up to 10 seconds
-          nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
-          if (nativeInput) break;
-          await wait(250);
-        }
-
-        if (!nativeInput) {
-          console.error('[Ariba Ext] Checkbox #mat-mdc-checkbox-0-input not found.');
-          return 'done';
-        }
-
-        const isChecked = nativeInput.checked;
-        console.log('[Ariba Ext] Checkbox state:', isChecked);
-
-        if (isChecked) {
-          // Already checked → click once
-          nativeInput.click();
-          console.log('[Ariba Ext] Was checked — clicked once.');
-        } else {
-          // Unchecked → click twice with buffer so Angular registers each change
-          nativeInput.click();
-          console.log('[Ariba Ext] Was unchecked — first click done. Waiting...');
-          await wait(600);
-          nativeInput.click();
-          console.log('[Ariba Ext] Second click done.');
         }
 
         return 'done';
