@@ -1,12 +1,30 @@
 // Open standalone panel window when extension icon is clicked
-chrome.action.onClicked.addListener(() => {
-  chrome.windows.create({
-    url: chrome.runtime.getURL('panel.html'),
-    type: 'popup',
-    width: 400,
-    height: 520,
-    focused: true
-  });
+chrome.action.onClicked.addListener(async () => {
+  const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL('panel.html') });
+  if (tabs.length > 0) {
+    const tab = tabs[0];
+    try {
+      chrome.windows.update(tab.windowId, { focused: true });
+      chrome.tabs.update(tab.id, { active: true });
+    } catch (e) {
+      // If window focus failed (maybe window was closed but tab state not fully updated), open a new one
+      chrome.windows.create({
+        url: chrome.runtime.getURL('panel.html'),
+        type: 'popup',
+        width: 400,
+        height: 520,
+        focused: true
+      });
+    }
+  } else {
+    chrome.windows.create({
+      url: chrome.runtime.getURL('panel.html'),
+      type: 'popup',
+      width: 400,
+      height: 520,
+      focused: true
+    });
+  }
 });
 
 // -----------------------------------------------------------------------
@@ -18,7 +36,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
   const target = { tabId };
 
   try {
-    notifyPanel('Attaching debugger for screenshot...');
+    notifyAribaTab(tabId, 'Attaching debugger for screenshot...');
 
     // 1. Attach debugger
     await new Promise((resolve, reject) => {
@@ -48,7 +66,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
     const fullW = Math.ceil(width);
     const fullH = Math.ceil(height);
 
-    notifyPanel(`Capturing full page (${fullW}×${fullH}px)...`);
+    notifyAribaTab(tabId, `Capturing full page (${fullW}×${fullH}px)...`);
 
     // 4. Expand the viewport to the full page size (this is the key step —
     //    without this, captureBeyondViewport tiles the same viewport repeatedly)
@@ -89,7 +107,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
     });
 
     if (!screenshotResult?.data) {
-      notifyPanel('Screenshot capture returned no data.', true);
+      notifyAribaTab(tabId, 'Screenshot capture returned no data.', true);
       return null;
     }
 
@@ -99,9 +117,9 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 
     chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, () => {
       if (chrome.runtime.lastError) {
-        notifyPanel('Screenshot save failed: ' + chrome.runtime.lastError.message, true);
+        notifyAribaTab(tabId, 'Screenshot save failed: ' + chrome.runtime.lastError.message, true);
       } else {
-        notifyPanel(`Screenshot saved → ${filename}`, false, false);
+        notifyAribaTab(tabId, `Screenshot saved → ${filename}`);
       }
     });
 
@@ -110,7 +128,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
   } catch (err) {
     // Always detach on error to release the tab
     chrome.debugger.detach(target, () => { });
-    notifyPanel('Screenshot error: ' + err.message, true);
+    notifyAribaTab(tabId, 'Screenshot error: ' + err.message, true);
     return null;
   }
 }
@@ -118,6 +136,12 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
+function notifyAribaTab(tabId, text, isError = false) {
+  if (tabId) {
+    chrome.tabs.sendMessage(tabId, { action: 'showToast', text, isError }).catch(() => { });
+  }
+}
+
 function notifyPanel(text, error = false, done = false) {
   chrome.runtime.sendMessage({ type: 'status', text, error, done }).catch(() => { });
 }
@@ -165,6 +189,7 @@ async function maybeOpenNotebookLM(supplier) {
   await clearState(supplier);
 
   if (!state.config?.connectToNotebooklm) {
+    notifyAribaTab(state.aribaTabId, 'Downloads complete!');
     notifyPanel('Downloads complete!', false, true);
     return;
   }
@@ -177,10 +202,12 @@ async function maybeOpenNotebookLM(supplier) {
     if (gistResponse.ok) {
       gistText = await gistResponse.text();
     } else {
-      console.warn('[Ariba Ext] Failed to fetch gist text. Status:', gistResponse.status);
+      // console.warn('[Ariba Ext] Failed to fetch gist text. Status:', gistResponse.status);
+      notifyPanel('Failed to fetch system instructions from Gist.', true);
     }
   } catch (err) {
-    console.error('[Ariba Ext] Error fetching gist:', err);
+    // console.error('[Ariba Ext] Error fetching gist:', err);
+    notifyPanel('Error fetching system instructions: ' + err.message, true);
   }
 
   notifyPanel('Opening NotebookLM...');
@@ -188,13 +215,51 @@ async function maybeOpenNotebookLM(supplier) {
   const filesForNotebook = state.filesForNotebook || [];
 
   // Wait for the page to fully load, then inject the checkbox and sync script
-  chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
+  // Guard: prevent the script from firing more than once if 'complete' triggers multiple times
+  let fired = false;
+  chrome.tabs.onUpdated.addListener(async function listener(tabId, info) {
     if (tabId !== tab.id || info.status !== 'complete') return;
+    if (fired) return;
+    fired = true;
 
+    // 1. Inject message bridge in isolated world to relay messages from main world to the panel
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          if (!window.hasNotebookLMMsgBridge) {
+            window.hasNotebookLMMsgBridge = true;
+            window.addEventListener('message', (event) => {
+              if (event.data && event.data.source === 'ariba-notebooklm-injected') {
+                chrome.runtime.sendMessage({
+                  type: 'status',
+                  text: event.data.text,
+                  error: event.data.error,
+                  done: event.data.done
+                }).catch(() => {});
+              }
+            });
+          }
+        }
+      });
+    } catch (e) {
+      // Failed to inject message bridge
+    }
+
+    // 2. Inject main script in MAIN world
     chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN',
       func: async (instructionText, filesToUpload) => {
+        const sendStatus = (text, error = false, done = false) => {
+          window.postMessage({
+            source: 'ariba-notebooklm-injected',
+            text: text,
+            error: error,
+            done: done
+          }, '*');
+        };
+
         const wait = ms => new Promise(r => setTimeout(r, ms));
         const generateReqId = () => Math.floor(Math.random() * 90000) + 10000;
 
@@ -207,7 +272,8 @@ async function maybeOpenNotebookLM(supplier) {
         if (notebookId && instructionText) {
           const syncKey = `synced_${notebookId}`;
           if (!sessionStorage.getItem(syncKey)) {
-            console.log('[Ariba Ext] Direct system instruction sync started...');
+            // console.log('[Ariba Ext] Direct system instruction sync started...');
+            sendStatus('Syncing system instructions to NotebookLM...');
             const authToken = window.WIZ_global_data?.SNlM0e;
             
             if (authToken) {
@@ -253,22 +319,25 @@ async function maybeOpenNotebookLM(supplier) {
                 });
 
                 if (response.ok) {
-                  console.log('[Ariba Ext] System instructions successfully synced to custom!');
+                  // console.log('[Ariba Ext] System instructions successfully synced to custom!');
+                  sendStatus('System instructions synced successfully.');
                   sessionStorage.setItem(syncKey, 'true');
                 } else {
-                  console.error('[Ariba Ext] Failed to update system instructions:', response.statusText);
+                  // console.error('[Ariba Ext] Failed to update system instructions:', response.statusText);
+                  sendStatus('Failed to sync system instructions: ' + response.statusText, true);
                 }
               } catch (err) {
-                console.error('[Ariba Ext] Error updating system instructions:', err);
+                // console.error('[Ariba Ext] Error updating system instructions:', err);
+                sendStatus('Error syncing system instructions: ' + err.message, true);
               }
             } else {
-              console.error('[Ariba Ext] Auth token not found in WIZ_global_data.');
+              // console.error('[Ariba Ext] Auth token not found in WIZ_global_data.');
+              sendStatus('Auth token not found for syncing.', true);
             }
           }
         }
 
         // ── Step 1: Toggle the checkbox BEFORE uploading ──────────────────
-        // Poll for the checkbox — Angular/Material may take a moment to render
         let nativeInput = null;
         for (let i = 0; i < 40; i++) {          // up to 10 seconds
           nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
@@ -277,46 +346,46 @@ async function maybeOpenNotebookLM(supplier) {
         }
 
         if (!nativeInput) {
-          console.error('[Ariba Ext] Checkbox #mat-mdc-checkbox-0-input not found. Continuing with upload anyway.');
+          // console.error('[Ariba Ext] Checkbox #mat-mdc-checkbox-0-input not found. Continuing with upload anyway.');
+          sendStatus('Select All checkbox not found, skipping toggle...');
         } else {
           const isChecked = nativeInput.checked;
-          console.log('[Ariba Ext] Checkbox state:', isChecked);
+          // console.log('[Ariba Ext] Checkbox state:', isChecked);
 
           if (isChecked) {
-            // Already checked → click once
             nativeInput.click();
-            console.log('[Ariba Ext] Was checked — clicked once.');
+            // console.log('[Ariba Ext] Was checked — clicked once.');
           } else {
-            // Unchecked → click twice with buffer so Angular registers each change
             nativeInput.click();
-            console.log('[Ariba Ext] Was unchecked — first click done. Waiting...');
+            // console.log('[Ariba Ext] Was unchecked — first click done. Waiting...');
             await wait(600);
             nativeInput.click();
-            console.log('[Ariba Ext] Second click done.');
+            // console.log('[Ariba Ext] Second click done.');
           }
 
-          // Let Angular settle after checkbox state change before uploading
           await wait(1500);
-          console.log('[Ariba Ext] Checkbox toggle done. Proceeding with file upload...');
+          // console.log('[Ariba Ext] Checkbox toggle done. Proceeding with file upload...');
+          sendStatus('Unchecked Select All button.');
         }
 
         // ── Step 1.5: Close the upload modal if it is open ────────────────
-        // NotebookLM sometimes shows an upload-from-drive modal on load;
-        // close it so it doesn't block the source panel.
         const closeBtn = document.querySelector('button[aria-label="Close"].close-button');
         if (closeBtn) {
           closeBtn.click();
-          console.log('[Ariba Ext] Closed upload modal.');
+          // console.log('[Ariba Ext] Closed upload modal.');
+          sendStatus('Closed NotebookLM Drive upload modal.');
           await wait(500);
         } else {
-          console.log('[Ariba Ext] No upload modal found, continuing...');
+          // console.log('[Ariba Ext] No upload modal found, continuing...');
         }
 
         // ── Step 2: Upload session files to NotebookLM via WIZ RPC and Scotty ──
         if (notebookId && filesToUpload && filesToUpload.length > 0) {
           const uploadKey = `uploaded_${notebookId}`;
           if (!sessionStorage.getItem(uploadKey)) {
-            console.log('[Ariba Ext] Registering and uploading files via API...', filesToUpload.length);
+            sessionStorage.setItem(uploadKey, 'true');
+            // console.log('[Ariba Ext] Registering and uploading files via API...', filesToUpload.length);
+            sendStatus(`Registering ${filesToUpload.length} documents in NotebookLM...`);
 
             try {
               const getWizData = () => {
@@ -330,7 +399,8 @@ async function maybeOpenNotebookLM(supplier) {
 
               const wiz = getWizData();
               if (!wiz.at) {
-                console.error('[Ariba Ext] Auth token (at) not found in WIZ_global_data.');
+                // console.error('[Ariba Ext] Auth token (at) not found in WIZ_global_data.');
+                sendStatus('Auth token not found for file registration.', true);
               } else {
                 const fileItems = filesToUpload.map(f => {
                   if (f.filename.toLowerCase().endsWith('.png')) {
@@ -373,25 +443,18 @@ async function maybeOpenNotebookLM(supplier) {
                 }
 
                 const responseText = await response.text();
+                // console.log('[Ariba Ext] FULL raw o4cbdc response:', responseText);
 
-                // Log raw response to help debug format issues
-                console.log('[Ariba Ext] FULL raw o4cbdc response:', responseText);
-
-                // The batchexecute response contains:  ["wrb.fr","o4cbdc","<escaped_json>", ...]
-                // We locate the "o4cbdc" marker and extract the next JSON string that follows
                 let parsedInner = null;
                 try {
-                  // Find the index of the o4cbdc marker
                   const markerIdx = responseText.indexOf('"o4cbdc"');
                   if (markerIdx === -1) {
                     throw new Error('o4cbdc marker not found in response text.');
                   }
-                  // After `"o4cbdc","` there is the escaped JSON string. Find the start of that string.
-                  const afterMarker = responseText.indexOf('"', markerIdx + '"o4cbdc"'.length + 1); // skip comma
+                  const afterMarker = responseText.indexOf('"', markerIdx + '"o4cbdc"'.length + 1);
                   if (afterMarker === -1) {
                     throw new Error('Could not find opening quote of o4cbdc inner JSON string.');
                   }
-                  // Walk forward to find the end of this JSON string (unescaped closing quote)
                   let innerJsonStr = '';
                   let i = afterMarker + 1;
                   while (i < responseText.length) {
@@ -406,14 +469,12 @@ async function maybeOpenNotebookLM(supplier) {
                       i++;
                     }
                   }
-                  console.log('[Ariba Ext] Extracted inner JSON string (first 200 chars):', innerJsonStr.slice(0, 200));
+                  // console.log('[Ariba Ext] Extracted inner JSON string (first 200 chars):', innerJsonStr.slice(0, 200));
                   parsedInner = JSON.parse(innerJsonStr);
                 } catch (parseErr) {
                   throw new Error('Failed to parse o4cbdc inner JSON: ' + parseErr.message);
                 }
 
-
-                // Map response filenames to their corresponding source IDs
                 const responseFiles = parsedInner[0] || [];
                 const sourceIdMap = {};
                 for (const item of responseFiles) {
@@ -424,9 +485,8 @@ async function maybeOpenNotebookLM(supplier) {
                   }
                 }
 
-                console.log('[Ariba Ext] Extracted Source ID Map:', sourceIdMap);
+                // console.log('[Ariba Ext] Extracted Source ID Map:', sourceIdMap);
 
-                // Helper to match filesToUpload to source IDs case-insensitively and with substrings
                 const findSourceIdForFile = (localFilename) => {
                   const localClean = localFilename.trim().toLowerCase();
                   for (const [filename, sourceId] of Object.entries(sourceIdMap)) {
@@ -442,7 +502,8 @@ async function maybeOpenNotebookLM(supplier) {
                   return null;
                 };
 
-                console.log(`[Ariba Ext] Starting batch uploads for ${filesToUpload.length} files...`);
+                // console.log(`[Ariba Ext] Starting batch uploads for ${filesToUpload.length} files...`);
+                sendStatus(`Uploading ${filesToUpload.length} documents...`);
 
                 const batchSize = 5;
                 for (let i = 0; i < filesToUpload.length; i += batchSize) {
@@ -451,17 +512,17 @@ async function maybeOpenNotebookLM(supplier) {
                   await Promise.all(chunkFiles.map(async (file) => {
                     const sourceId = findSourceIdForFile(file.filename);
                     if (!sourceId) {
-                      console.warn(`[Ariba Ext] Could not find sourceId for file: ${file.filename}. Skipping upload.`);
+                      // console.warn(`[Ariba Ext] Could not find sourceId for file: ${file.filename}. Skipping upload.`);
+                      sendStatus(`Skipping ${file.filename} (ID not found)`, true);
                       return;
                     }
 
                     try {
-                      console.log(`[Ariba Ext] Fetching local blob for ${file.filename}...`);
+                      // console.log(`[Ariba Ext] Fetching local blob for ${file.filename}...`);
                       const res = await fetch(file.dataUrl);
                       const blob = await res.blob();
 
-                      console.log(`[Ariba Ext] Initiating Scotty upload session for ${file.filename} (sourceId: ${sourceId})...`);
-                      // URL uses only source_id as query param (confirmed from real network trace)
+                      // console.log(`[Ariba Ext] Initiating Scotty upload session for ${file.filename} (sourceId: ${sourceId})...`);
                       const initUrl = `https://notebooklm.google.com/upload/_/?authuser=0&source_id=${encodeURIComponent(sourceId)}`;
                       const initRes = await fetch(initUrl, {
                         method: 'POST',
@@ -472,7 +533,6 @@ async function maybeOpenNotebookLM(supplier) {
                           'X-Goog-Upload-Header-Content-Type': file.mimeType,
                           'Content-Type': 'application/json'
                         },
-                        // Exact body format confirmed from NotebookLM network trace
                         body: JSON.stringify({
                           PROJECT_ID: notebookId,
                           SOURCE_NAME: file.filename,
@@ -480,10 +540,9 @@ async function maybeOpenNotebookLM(supplier) {
                         })
                       });
 
-                      // Log all response headers for debugging
                       const initHeaders = {};
                       initRes.headers.forEach((v, k) => { initHeaders[k] = v; });
-                      console.log(`[Ariba Ext] Initiation response status: ${initRes.status}`, initHeaders);
+                      // console.log(`[Ariba Ext] Initiation response status: ${initRes.status}`, initHeaders);
 
                       if (!initRes.ok) {
                         const errBody = await initRes.text().catch(() => '');
@@ -492,10 +551,10 @@ async function maybeOpenNotebookLM(supplier) {
 
                       const uploadSessionUrl = initRes.headers.get('X-Goog-Upload-URL');
                       if (!uploadSessionUrl) {
-                        throw new Error('X-Goog-Upload-URL header not found in session start response. Headers: ' + JSON.stringify(initHeaders));
+                        throw new Error('X-Goog-Upload-URL header not found in session start response.');
                       }
 
-                      console.log(`[Ariba Ext] Uploading bytes of ${file.filename} to session URL...`);
+                      // console.log(`[Ariba Ext] Uploading bytes of ${file.filename} to session URL...`);
                       const uploadRes = await fetch(uploadSessionUrl, {
                         method: 'PUT',
                         headers: {
@@ -508,24 +567,99 @@ async function maybeOpenNotebookLM(supplier) {
                       });
 
                       if (uploadRes.ok) {
-                        console.log(`[Ariba Ext] Uploaded successfully: ${file.filename}`);
+                        // console.log(`[Ariba Ext] Uploaded successfully: ${file.filename}`);
+                        sendStatus(`Uploaded ${file.filename} successfully.`);
                       } else {
                         const uploadErrBody = await uploadRes.text().catch(() => '');
-                        console.error(`[Ariba Ext] Failed to upload ${file.filename}: ${uploadRes.status} — ${uploadErrBody.slice(0, 200)}`);
+                        // console.error(`[Ariba Ext] Failed to upload ${file.filename}: ${uploadRes.status} — ${uploadErrBody.slice(0, 200)}`);
+                        sendStatus(`Failed to upload ${file.filename}: ${uploadRes.status}`, true);
                       }
                     } catch (err) {
-                      console.error(`[Ariba Ext] Error uploading ${file.filename}:`, err);
+                      // console.error(`[Ariba Ext] Error uploading ${file.filename}:`, err);
+                      sendStatus(`Error uploading ${file.filename}: ${err.message}`, true);
                     }
                   }));
                 }
 
-                sessionStorage.setItem(uploadKey, 'true');
-                console.log('[Ariba Ext] All files uploaded via direct API.');
+                // console.log('[Ariba Ext] All files uploaded via direct API.');
+                sendStatus('All files uploaded successfully.');
+                
+                // Wait for processing/loading to finish by polling for visible spinners and progress bars
+                // console.log('[Ariba Ext] Waiting for NotebookLM to finish processing all documents...');
+                sendStatus('Waiting for NotebookLM to finish processing all documents...');
+                
+                const maxWaitMs = 120000; // 2 minutes max
+                const intervalMs = 1000;
+                let elapsedMs = 0;
+                
+                const isVisible = (el) => {
+                  return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                };
+
+                while (elapsedMs < maxWaitMs) {
+                  const potentialLoaders = Array.from(document.querySelectorAll('mat-progress-spinner, mat-spinner, mat-progress-bar, .loading, .spinner, [role="progressbar"]'));
+                  const visibleLoaders = potentialLoaders.filter(isVisible);
+
+                  const allElements = Array.from(document.querySelectorAll('*'));
+                  const visibleLoadingTextElements = allElements.filter(el => {
+                    if (el.children.length > 0) return false;
+                    if (!isVisible(el)) return false;
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    return text.includes('uploading...') || text.includes('processing...');
+                  });
+
+                  if (visibleLoaders.length === 0 && visibleLoadingTextElements.length === 0) {
+                    // console.log('[Ariba Ext] No visible spinners or loading text found. Processing complete!');
+                    sendStatus('NotebookLM finished processing all documents.');
+                    break;
+                  }
+
+                  // console.log(`[Ariba Ext] Still processing. Visible loaders: ${visibleLoaders.length}, Visible loading text elements: ${visibleLoadingTextElements.length}. Waiting...`);
+                  await wait(intervalMs);
+                  elapsedMs += intervalMs;
+                }
+
+                // Add 2-second buffer right after processing finishes
+                // console.log('[Ariba Ext] Waiting 2 seconds for UI to settle...');
+                await wait(2000);
               }
             } catch (err) {
-              console.error('[Ariba Ext] API upload failed:', err);
+              // console.error('[Ariba Ext] API upload failed:', err);
+              sendStatus('API upload failed: ' + err.message, true);
             }
           }
+        }
+
+        // ── Step 3: Run the prompt "Run" and click Submit ─────────────────
+        // console.log('[Ariba Ext] Waiting for query box textarea to appear...');
+        let queryTextarea = null;
+        for (let i = 0; i < 40; i++) {          // up to 10 seconds
+          queryTextarea = document.querySelector('textarea.query-box-input') || document.querySelector('textarea[aria-label="Query box"]');
+          if (queryTextarea) break;
+          await wait(250);
+        }
+
+        if (queryTextarea) {
+          // console.log('[Ariba Ext] Query box found. Typing "Run"...');
+          sendStatus('Typing "Run" prompt...');
+          queryTextarea.value = 'Run';
+          queryTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+          queryTextarea.dispatchEvent(new Event('change', { bubbles: true }));
+
+          await wait(500);
+
+          const submitBtn = document.querySelector('button.submit-button') || document.querySelector('button[aria-label="Submit"]');
+          if (submitBtn) {
+            submitBtn.click();
+            // console.log('[Ariba Ext] Typed "Run" and clicked submit.');
+            sendStatus('Submitted prompt! Process complete.', false, true);
+          } else {
+            // console.error('[Ariba Ext] Submit button not found.');
+            sendStatus('Submit button not found in NotebookLM.', true);
+          }
+        } else {
+          // console.error('[Ariba Ext] Query box textarea not found.');
+          sendStatus('Query box textarea not found in NotebookLM.', true);
         }
 
         return 'done';
@@ -533,7 +667,8 @@ async function maybeOpenNotebookLM(supplier) {
       args: [gistText, filesForNotebook]
     }, (results) => {
       if (chrome.runtime.lastError) {
-        console.error('Sync/Checkbox script error: ' + chrome.runtime.lastError.message);
+        // console.error('Sync/Checkbox script error: ' + chrome.runtime.lastError.message);
+        notifyPanel('Sync/Checkbox script error: ' + chrome.runtime.lastError.message, true);
         chrome.tabs.onUpdated.removeListener(listener);
         return;
       }
@@ -577,21 +712,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               mimeType: blob.type
             });
           } else {
-            console.error('[Ariba Ext] Failed to fetch file for NotebookLM upload:', file.filename, resp.status);
+            // console.error('[Ariba Ext] Failed to fetch file for NotebookLM upload:', file.filename, resp.status);
+            notifyAribaTab(tabId, `Failed to fetch file: ${file.filename}`, true);
           }
         } catch (err) {
-          console.error('[Ariba Ext] Error fetching file for NotebookLM upload:', file.filename, err);
+          // console.error('[Ariba Ext] Error fetching file for NotebookLM upload:', file.filename, err);
+          notifyAribaTab(tabId, `Error fetching file: ${file.filename}`, true);
         }
       }
 
-      notifyPanel(`Queued ${(request.files || []).length} file(s). Taking full-page screenshot...`);
+      notifyAribaTab(tabId, `Queued ${(request.files || []).length} file(s). Taking full-page screenshot...`);
 
       // Capture full-page screenshot AFTER kicking off downloads
       let screenshotDataUrl = null;
       if (tabId) {
         screenshotDataUrl = await captureFullPageScreenshot(tabId, s);
       } else {
-        notifyPanel('Could not determine Ariba tab for screenshot.', true);
+        notifyAribaTab(tabId, 'Could not determine Ariba tab for screenshot.', true);
       }
 
       if (screenshotDataUrl) {
@@ -607,6 +744,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       state.config = notebooklmConfig || null;
       state.filesDone = true;
       state.filesForNotebook = filesForNotebook;
+      state.aribaTabId = tabId;
       await setState(s, state);
       await maybeOpenNotebookLM(s);
     }
