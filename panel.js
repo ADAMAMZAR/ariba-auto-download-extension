@@ -1,10 +1,9 @@
 document.addEventListener('DOMContentLoaded', () => {
-  const downloadBtn          = document.getElementById('download-btn');
-  const screenshotBtn        = document.getElementById('screenshot-btn');
-  const connectCheckbox      = document.getElementById('connect-notebooklm');
-  const notebooklmContainer  = document.getElementById('notebooklm-container');
-  const notebooklmUrlInput   = document.getElementById('notebooklm-url');
-  const logEntries           = document.getElementById('log-entries');
+  const downloadBtn = document.getElementById('download-btn');
+  const connectCheckbox = document.getElementById('connect-notebooklm');
+  const notebooklmContainer = document.getElementById('notebooklm-container');
+  const notebooklmUrlInput = document.getElementById('notebooklm-url');
+  const logEntries = document.getElementById('log-entries');
 
   function addLog(text, type = 'info') {
     const el = document.createElement('div');
