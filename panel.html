@@ -1,24 +1,26 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
-  <title>Ariba Auto Download</title>
+  <title>GPO - Automatic Certificate Checker</title>
   <link rel="stylesheet" href="styles.css">
 </head>
+
 <body>
   <div class="container">
-    <h2>⬇ Ariba Auto Download</h2>
-    <p class="description">Navigate to the Ariba supplier page, then click the button below to expand all sections and download all attachments.</p>
+    <h2>⬇ GPO - Automatic Certificate Checker</h2>
+    <p class="description">Navigate to the Ariba supplier page, then click the button below to expand all sections and
+      download all attachments.</p>
 
     <button id="download-btn">Download Attachments</button>
-    <button id="screenshot-btn" class="btn-secondary">📷 Test Screenshot</button>
 
     <div class="checkbox-group">
-      <input type="checkbox" id="connect-notebooklm" />
+      <input type="checkbox" id="connect-notebooklm" checked />
       <label for="connect-notebooklm">Upload to NotebookLM after download</label>
     </div>
 
-    <div id="notebooklm-container" style="display: none;">
+    <div id="notebooklm-container">
       <div class="input-group">
         <label for="notebooklm-url">NotebookLM Notebook URL</label>
         <input type="url" id="notebooklm-url" placeholder="https://notebooklm.google.com/notebook/..." />
@@ -32,4 +34,5 @@
   </div>
   <script src="panel.js"></script>
 </body>
+
 </html>
