@@ -90,7 +90,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 
     if (!screenshotResult?.data) {
       notifyPanel('Screenshot capture returned no data.', true);
-      return;
+      return null;
     }
 
     // 8. Save as PNG into the supplier folder
@@ -105,10 +105,13 @@ async function captureFullPageScreenshot(tabId, supplierName) {
       }
     });
 
+    return dataUrl;
+
   } catch (err) {
     // Always detach on error to release the tab
     chrome.debugger.detach(target, () => { });
     notifyPanel('Screenshot error: ' + err.message, true);
+    return null;
   }
 }
 
@@ -120,6 +123,23 @@ function notifyPanel(text, error = false, done = false) {
 }
 
 function cleanName(n) { return n.replace(/[\/\\?%*:|"<>]/g, '-'); }
+
+function uint8ArrayToBase64(bytes) {
+  let binary = '';
+  const len = bytes.byteLength;
+  const chunk = 8192;
+  for (let i = 0; i < len; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function blobToDataUrl(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  const base64 = uint8ArrayToBase64(bytes);
+  return `data:${blob.type};base64,${base64}`;
+}
 
 // -----------------------------------------------------------------------
 // Persistent state via chrome.storage.session
@@ -165,6 +185,7 @@ async function maybeOpenNotebookLM(supplier) {
 
   notifyPanel('Opening NotebookLM...');
   const tab = await chrome.tabs.create({ url: state.config.notebooklmUrl });
+  const filesForNotebook = state.filesForNotebook || [];
 
   // Wait for the page to fully load, then inject the checkbox and sync script
   chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
@@ -173,7 +194,7 @@ async function maybeOpenNotebookLM(supplier) {
     chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN',
-      func: async (instructionText) => {
+      func: async (instructionText, filesToUpload) => {
         const wait = ms => new Promise(r => setTimeout(r, ms));
         const generateReqId = () => Math.floor(Math.random() * 90000) + 10000;
 
@@ -248,6 +269,222 @@ async function maybeOpenNotebookLM(supplier) {
           }
         }
 
+        // Upload session files to NotebookLM via WIZ RPC and Scotty
+        if (notebookId && filesToUpload && filesToUpload.length > 0) {
+          const uploadKey = `uploaded_${notebookId}`;
+          if (!sessionStorage.getItem(uploadKey)) {
+            console.log('[Ariba Ext] Registering and uploading files via API...', filesToUpload.length);
+
+            try {
+              const getWizData = () => {
+                const data = window.WIZ_global_data || {};
+                return {
+                  bl: data.cfb2h || 'boq_labs-tailwind-frontend_20260518.10_p0',
+                  fSid: data.Fdrif || '-5077533628963748752',
+                  at: data.SNlM0e
+                };
+              };
+
+              const wiz = getWizData();
+              if (!wiz.at) {
+                console.error('[Ariba Ext] Auth token (at) not found in WIZ_global_data.');
+              } else {
+                const fileItems = filesToUpload.map(f => {
+                  if (f.filename.toLowerCase().endsWith('.png')) {
+                    return [f.filename, 13];
+                  } else {
+                    return [f.filename];
+                  }
+                });
+
+                const payload = [
+                  fileItems,
+                  notebookId,
+                  [2, null, null, [1, null, null, null, null, null, null, null, null, null, [1]]]
+                ];
+
+                const envelope = [
+                  'o4cbdc',
+                  JSON.stringify(payload),
+                  null,
+                  'generic'
+                ];
+
+                const formData = new URLSearchParams();
+                formData.set('f.req', JSON.stringify([[envelope]]));
+                formData.set('at', wiz.at);
+
+                const reqId = generateReqId();
+                const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=o4cbdc&_reqid=${reqId}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+
+                const response = await fetch(url, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                  },
+                  body: formData.toString()
+                });
+
+                if (!response.ok) {
+                  throw new Error(`o4cbdc request failed with status: ${response.status}`);
+                }
+
+                const responseText = await response.text();
+
+                // Log raw response to help debug format issues
+                console.log('[Ariba Ext] FULL raw o4cbdc response:', responseText);
+
+                // The batchexecute response contains:  ["wrb.fr","o4cbdc","<escaped_json>", ...]
+                // We locate the "o4cbdc" marker and extract the next JSON string that follows
+                let parsedInner = null;
+                try {
+                  // Find the index of the o4cbdc marker
+                  const markerIdx = responseText.indexOf('"o4cbdc"');
+                  if (markerIdx === -1) {
+                    throw new Error('o4cbdc marker not found in response text.');
+                  }
+                  // After `"o4cbdc","` there is the escaped JSON string. Find the start of that string.
+                  const afterMarker = responseText.indexOf('"', markerIdx + '"o4cbdc"'.length + 1); // skip comma
+                  if (afterMarker === -1) {
+                    throw new Error('Could not find opening quote of o4cbdc inner JSON string.');
+                  }
+                  // Walk forward to find the end of this JSON string (unescaped closing quote)
+                  let innerJsonStr = '';
+                  let i = afterMarker + 1;
+                  while (i < responseText.length) {
+                    const ch = responseText[i];
+                    if (ch === '\\') {
+                      innerJsonStr += responseText[i + 1];
+                      i += 2;
+                    } else if (ch === '"') {
+                      break;
+                    } else {
+                      innerJsonStr += ch;
+                      i++;
+                    }
+                  }
+                  console.log('[Ariba Ext] Extracted inner JSON string (first 200 chars):', innerJsonStr.slice(0, 200));
+                  parsedInner = JSON.parse(innerJsonStr);
+                } catch (parseErr) {
+                  throw new Error('Failed to parse o4cbdc inner JSON: ' + parseErr.message);
+                }
+
+
+                // Map response filenames to their corresponding source IDs
+                const responseFiles = parsedInner[0] || [];
+                const sourceIdMap = {};
+                for (const item of responseFiles) {
+                  const sourceId = item[0]?.[0];
+                  const filename = item[1];
+                  if (sourceId && filename) {
+                    sourceIdMap[filename.trim()] = sourceId;
+                  }
+                }
+
+                console.log('[Ariba Ext] Extracted Source ID Map:', sourceIdMap);
+
+                // Helper to match filesToUpload to source IDs case-insensitively and with substrings
+                const findSourceIdForFile = (localFilename) => {
+                  const localClean = localFilename.trim().toLowerCase();
+                  for (const [filename, sourceId] of Object.entries(sourceIdMap)) {
+                    if (filename.trim().toLowerCase() === localClean) {
+                      return sourceId;
+                    }
+                  }
+                  for (const [filename, sourceId] of Object.entries(sourceIdMap)) {
+                    if (filename.toLowerCase().includes(localClean) || localClean.includes(filename.toLowerCase())) {
+                      return sourceId;
+                    }
+                  }
+                  return null;
+                };
+
+                console.log(`[Ariba Ext] Starting batch uploads for ${filesToUpload.length} files...`);
+
+                const batchSize = 5;
+                for (let i = 0; i < filesToUpload.length; i += batchSize) {
+                  const chunkFiles = filesToUpload.slice(i, i + batchSize);
+
+                  await Promise.all(chunkFiles.map(async (file) => {
+                    const sourceId = findSourceIdForFile(file.filename);
+                    if (!sourceId) {
+                      console.warn(`[Ariba Ext] Could not find sourceId for file: ${file.filename}. Skipping upload.`);
+                      return;
+                    }
+
+                    try {
+                      console.log(`[Ariba Ext] Fetching local blob for ${file.filename}...`);
+                      const res = await fetch(file.dataUrl);
+                      const blob = await res.blob();
+
+                      console.log(`[Ariba Ext] Initiating Scotty upload session for ${file.filename} (sourceId: ${sourceId})...`);
+                      // URL uses only source_id as query param (confirmed from real network trace)
+                      const initUrl = `https://notebooklm.google.com/upload/_/?authuser=0&source_id=${encodeURIComponent(sourceId)}`;
+                      const initRes = await fetch(initUrl, {
+                        method: 'POST',
+                        headers: {
+                          'X-Goog-Upload-Protocol': 'resumable',
+                          'X-Goog-Upload-Command': 'start',
+                          'X-Goog-Upload-Header-Content-Length': blob.size.toString(),
+                          'X-Goog-Upload-Header-Content-Type': file.mimeType,
+                          'Content-Type': 'application/json'
+                        },
+                        // Exact body format confirmed from NotebookLM network trace
+                        body: JSON.stringify({
+                          PROJECT_ID: notebookId,
+                          SOURCE_NAME: file.filename,
+                          SOURCE_ID: sourceId
+                        })
+                      });
+
+                      // Log all response headers for debugging
+                      const initHeaders = {};
+                      initRes.headers.forEach((v, k) => { initHeaders[k] = v; });
+                      console.log(`[Ariba Ext] Initiation response status: ${initRes.status}`, initHeaders);
+
+                      if (!initRes.ok) {
+                        const errBody = await initRes.text().catch(() => '');
+                        throw new Error(`Failed to start upload session: ${initRes.status} ${initRes.statusText} — ${errBody.slice(0, 200)}`);
+                      }
+
+                      const uploadSessionUrl = initRes.headers.get('X-Goog-Upload-URL');
+                      if (!uploadSessionUrl) {
+                        throw new Error('X-Goog-Upload-URL header not found in session start response. Headers: ' + JSON.stringify(initHeaders));
+                      }
+
+                      console.log(`[Ariba Ext] Uploading bytes of ${file.filename} to session URL...`);
+                      const uploadRes = await fetch(uploadSessionUrl, {
+                        method: 'PUT',
+                        headers: {
+                          'X-Goog-Upload-Command': 'upload, finalize',
+                          'X-Goog-Upload-Offset': '0',
+                          'Content-Type': file.mimeType,
+                          'Content-Length': blob.size.toString()
+                        },
+                        body: blob
+                      });
+
+                      if (uploadRes.ok) {
+                        console.log(`[Ariba Ext] Uploaded successfully: ${file.filename}`);
+                      } else {
+                        const uploadErrBody = await uploadRes.text().catch(() => '');
+                        console.error(`[Ariba Ext] Failed to upload ${file.filename}: ${uploadRes.status} — ${uploadErrBody.slice(0, 200)}`);
+                      }
+                    } catch (err) {
+                      console.error(`[Ariba Ext] Error uploading ${file.filename}:`, err);
+                    }
+                  }));
+                }
+
+                sessionStorage.setItem(uploadKey, 'true');
+                console.log('[Ariba Ext] All files uploaded via direct API.');
+              }
+            } catch (err) {
+              console.error('[Ariba Ext] API upload failed:', err);
+            }
+          }
+        }
+
         // Poll for the checkbox — Angular/Material may take a moment to render
         let nativeInput = null;
         for (let i = 0; i < 40; i++) {          // up to 10 seconds
@@ -279,7 +516,7 @@ async function maybeOpenNotebookLM(supplier) {
 
         return 'done';
       },
-      args: [gistText]
+      args: [gistText, filesForNotebook]
     }, (results) => {
       if (chrome.runtime.lastError) {
         console.error('Sync/Checkbox script error: ' + chrome.runtime.lastError.message);
@@ -306,28 +543,56 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const s = cleanName(request.supplierName || 'Ariba');
       const tabId = sender.tab?.id;
 
-      // Queue all document downloads
+      // Queue local downloads and fetch them in memory for NotebookLM
+      const filesForNotebook = [];
       for (const file of (request.files || [])) {
         chrome.downloads.download({
           url: file.url,
           filename: `${s}/${s} - ${cleanName(file.filename)}`,
           saveAs: false
         });
+
+        try {
+          const resp = await fetch(file.url);
+          if (resp.ok) {
+            const blob = await resp.blob();
+            const dataUrl = await blobToDataUrl(blob);
+            filesForNotebook.push({
+              filename: `${s} - ${cleanName(file.filename)}`,
+              dataUrl: dataUrl,
+              mimeType: blob.type
+            });
+          } else {
+            console.error('[Ariba Ext] Failed to fetch file for NotebookLM upload:', file.filename, resp.status);
+          }
+        } catch (err) {
+          console.error('[Ariba Ext] Error fetching file for NotebookLM upload:', file.filename, err);
+        }
       }
 
       notifyPanel(`Queued ${(request.files || []).length} file(s). Taking full-page screenshot...`);
 
       // Capture full-page screenshot AFTER kicking off downloads
+      let screenshotDataUrl = null;
       if (tabId) {
-        await captureFullPageScreenshot(tabId, s);
+        screenshotDataUrl = await captureFullPageScreenshot(tabId, s);
       } else {
         notifyPanel('Could not determine Ariba tab for screenshot.', true);
+      }
+
+      if (screenshotDataUrl) {
+        filesForNotebook.push({
+          filename: `${s} - screenshot.png`,
+          dataUrl: screenshotDataUrl,
+          mimeType: 'image/png'
+        });
       }
 
       const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
       const state = await getState(s);
       state.config = notebooklmConfig || null;
       state.filesDone = true;
+      state.filesForNotebook = filesForNotebook;
       await setState(s, state);
       await maybeOpenNotebookLM(s);
     }

@@ -22,6 +22,9 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.local.set({ notebooklmUrl: notebooklmUrlInput.value });
   });
 
+  // Set initial display based on checkbox state
+  notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
+
   connectCheckbox.addEventListener('change', () => {
     notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
   });
@@ -66,10 +69,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Screenshot button — placeholder, no functionality yet
-  screenshotBtn.addEventListener('click', () => {
-    addLog('Screenshot feature coming soon.', 'info');
-  });
 
   // Listen for status messages from content / background
   chrome.runtime.onMessage.addListener((message) => {
