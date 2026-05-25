@@ -111,9 +111,9 @@ async function captureFullPageScreenshot(tabId, supplierName) {
       return null;
     }
 
-    // 8. Save as PNG into the supplier folder
+    // 8. Save as PNG into the supplier folder inside the extension root folder
     const dataUrl = 'data:image/png;base64,' + screenshotResult.data;
-    const filename = `${supplierName}/${supplierName} - screenshot.png`;
+    const filename = `GPO - Automatic Certificate Checker/${supplierName}/${supplierName} - screenshot.png`;
 
     chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, () => {
       if (chrome.runtime.lastError) {
@@ -129,6 +129,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
     // Always detach on error to release the tab
     chrome.debugger.detach(target, () => { });
     notifyAribaTab(tabId, 'Screenshot error: ' + err.message, true);
+    hideAribaLoader(tabId);
     return null;
   }
 }
@@ -139,6 +140,12 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 function notifyAribaTab(tabId, text, isError = false) {
   if (tabId) {
     chrome.tabs.sendMessage(tabId, { action: 'showToast', text, isError }).catch(() => { });
+  }
+}
+
+function hideAribaLoader(tabId) {
+  if (tabId) {
+    chrome.tabs.sendMessage(tabId, { action: 'hideLoader' }).catch(() => { });
   }
 }
 
@@ -191,6 +198,7 @@ async function maybeOpenNotebookLM(supplier) {
   if (!state.config?.connectToNotebooklm) {
     notifyAribaTab(state.aribaTabId, 'Downloads complete!');
     notifyPanel('Downloads complete!', false, true);
+    hideAribaLoader(state.aribaTabId);
     return;
   }
 
@@ -208,6 +216,8 @@ async function maybeOpenNotebookLM(supplier) {
   } catch (err) {
     // console.error('[Ariba Ext] Error fetching gist:', err);
     notifyPanel('Error fetching system instructions: ' + err.message, true);
+    notifyAribaTab(state.aribaTabId, 'Error fetching system instructions: ' + err.message, true);
+    hideAribaLoader(state.aribaTabId);
   }
 
   notifyPanel('Opening NotebookLM...');
@@ -342,6 +352,17 @@ async function maybeOpenNotebookLM(supplier) {
         for (let i = 0; i < 40; i++) {          // up to 10 seconds
           nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
           if (nativeInput) break;
+
+          // If the query box or the add-source/upload modal close button is already visible,
+          // then the page has finished loading. If the checkbox is still not there, we can skip the wait.
+          const queryBox = document.querySelector('textarea.query-box-input') || document.querySelector('textarea[aria-label="Query box"]');
+          const closeBtn = document.querySelector('button[aria-label="Close"].close-button');
+          if (queryBox || closeBtn) {
+            await wait(500); // Give Angular a small buffer to finish rendering elements
+            nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
+            break;
+          }
+
           await wait(250);
         }
 
@@ -669,6 +690,8 @@ async function maybeOpenNotebookLM(supplier) {
       if (chrome.runtime.lastError) {
         // console.error('Sync/Checkbox script error: ' + chrome.runtime.lastError.message);
         notifyPanel('Sync/Checkbox script error: ' + chrome.runtime.lastError.message, true);
+        notifyAribaTab(state.aribaTabId, 'NotebookLM injection failed: ' + chrome.runtime.lastError.message, true);
+        hideAribaLoader(state.aribaTabId);
         chrome.tabs.onUpdated.removeListener(listener);
         return;
       }
@@ -688,6 +711,21 @@ async function maybeOpenNotebookLM(supplier) {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   (async () => {
 
+    if (request.type === 'status') {
+      // Fetch the pending session states to relay status updates to Ariba tab and trigger hideLoader
+      try {
+        const allData = await chrome.storage.session.get(null);
+        for (const [key, val] of Object.entries(allData)) {
+          if (key.startsWith('pending_') && val.aribaTabId) {
+            notifyAribaTab(val.aribaTabId, request.text, request.error);
+            if (request.done || request.error) {
+              hideAribaLoader(val.aribaTabId);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
     if (request.action === 'downloadFiles') {
       const s = cleanName(request.supplierName || 'Ariba');
       const tabId = sender.tab?.id;
@@ -697,7 +735,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       for (const file of (request.files || [])) {
         chrome.downloads.download({
           url: file.url,
-          filename: `${s}/${s} - ${cleanName(file.filename)}`,
+          filename: `GPO - Automatic Certificate Checker/${s}/${s} - ${cleanName(file.filename)}`,
           saveAs: false
         });
 
