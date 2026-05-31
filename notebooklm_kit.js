@@ -1,0 +1,1513 @@
+// ============================================================
+// NotebookLM Kit — Content Script
+// Bundled into the Ariba Auto Download Extension so users get
+// both Ariba automation AND NotebookLM management tools in
+// a single extension install.
+//
+// Activates automatically when visiting notebooklm.google.com
+// — no Ariba session required.
+// ============================================================
+
+let authToken = '';
+let sourceCountCache = {}; // { notebookId: boolean } — true if notebook has at least 1 source
+let sourceCheckTimer = null;
+
+// Inject script to get tokens from the main page context
+function injectTokenScript() {
+  const script = document.createElement('script');
+  script.src = chrome.runtime.getURL('nlm_inject.js');
+  script.onload = () => script.remove();
+  (document.head || document.documentElement).appendChild(script);
+}
+
+// Listen for events from the injected script
+window.addEventListener('message', (event) => {
+  if (event.source !== window || !event.data) return;
+
+  if (event.data.type === 'NOTEBOOKLM_TOKEN_RESPONSE') {
+    authToken = event.data.token;
+  }
+
+  if (event.data.type === 'NOTEBOOKLM_SOURCES_UPDATED') {
+    const nbId = getNotebookId();
+    if (nbId) {
+      delete sourceCountCache[nbId]; // Always invalidate — source list just changed
+      scheduleSourceCheck(nbId);
+    }
+  }
+});
+
+// Function to get notebook ID from URL
+function getNotebookId() {
+  const match = window.location.pathname.match(/\/notebook\/([a-zA-Z0-9-]+)/);
+  return match ? match[1] : null;
+}
+
+// Generate random reqid
+function generateReqId() {
+  return Math.floor(Math.random() * 90000) + 10000;
+}
+
+// Fetch all sources for the current notebook
+async function fetchSources(notebookId) {
+  // MAINTENANCE: If fetching sources fails (e.g. 400 error), the RPC ID 'rLM1Ne' may have rotated.
+  // To fix: Open Network tab, refresh NotebookLM, look for 'batchexecute' and find the new ID.
+  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=rLM1Ne&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}&nlm_kit=true`;
+
+  const envelope = [
+    'rLM1Ne',
+    JSON.stringify([notebookId, null, [2], null, 0]),
+    null,
+    'generic'
+  ];
+
+  const formData = new URLSearchParams();
+  formData.set('f.req', JSON.stringify([[envelope]]));
+  formData.set('at', authToken);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+    },
+    body: formData.toString()
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch sources: ${response.statusText}`);
+  }
+
+  const text = await response.text();
+
+  const sourceObjects = [];
+  try {
+    // batchexecute returns string starting with )]}' 
+    const cleanText = text.replace(/^\)\]\}'\s*/, '');
+    const lines = cleanText.split('\n');
+
+    for (const line of lines) {
+      if (line.includes('wrb.fr') && line.includes('rLM1Ne')) {
+        let innerDataStr = null;
+
+        try {
+          // Standard batchexecute row: [ ["wrb.fr", "rLM1Ne", "[...]", "generic"] ]
+          const parsedLine = JSON.parse(line);
+          if (Array.isArray(parsedLine) && parsedLine.length > 0) {
+            const inner = Array.isArray(parsedLine[0]) ? parsedLine[0] : parsedLine;
+            if (inner[0] === 'wrb.fr' && inner[1] === 'rLM1Ne') {
+              innerDataStr = inner[2];
+            }
+          }
+        } catch (e) {
+          // Fallback if line is malformed or chunked format differs
+          const match = line.match(/\["wrb\.fr","rLM1Ne","(.*?)",/);
+          if (match) {
+            innerDataStr = JSON.parse('"' + match[1] + '"');
+          }
+        }
+
+        if (innerDataStr) {
+          const projectData = JSON.parse(innerDataStr);
+
+          let data = projectData;
+          if (Array.isArray(projectData[0])) {
+            data = projectData[0];
+          }
+
+          if (Array.isArray(data[1])) {
+            for (const sourceData of data[1]) {
+              if (!Array.isArray(sourceData)) continue;
+
+              let sourceId = null;
+              if (Array.isArray(sourceData[0]) && sourceData[0].length > 0) {
+                sourceId = sourceData[0][0];
+                if (Array.isArray(sourceId)) sourceId = sourceId[0]; // Handles [[[\"uuid\"]]]
+              } else if (typeof sourceData[0] === 'string') {
+                sourceId = sourceData[0];
+              }
+
+              if (!sourceId || typeof sourceId !== 'string') continue;
+              if (!sourceId.match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i)) continue;
+              if (sourceId === notebookId) continue;
+
+              const title = typeof sourceData[1] === 'string' ? sourceData[1] : 'Untitled';
+
+              if (!sourceObjects.find(s => s.id === sourceId)) {
+                sourceObjects.push({ id: sourceId, title });
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to cleanly parse sources, falling back to regex...', err);
+  }
+
+  return sourceObjects;
+}
+
+// Delete a single source
+async function deleteSource(notebookId, sourceId) {
+  // MAINTENANCE: If deletion fails, the RPC ID 'tGMBJ' may have rotated.
+  // To fix: Open Network tab, manually delete a source, and find the new ID in 'batchexecute'.
+  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=tGMBJ&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+
+  const formattedIds = [[[sourceId]], [2]];
+
+  const envelope = [
+    'tGMBJ',
+    JSON.stringify(formattedIds),
+    null,
+    'generic'
+  ];
+
+  const formData = new URLSearchParams();
+  formData.set('f.req', JSON.stringify([[envelope]]));
+  formData.set('at', authToken);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+    },
+    body: formData.toString()
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to delete source ${sourceId}`);
+  }
+}
+
+// Rename a single source
+async function renameSource(notebookId, sourceId, newTitle) {
+  // MAINTENANCE: If renaming fails, the RPC ID 'b7Wfje' may have rotated.
+  // To fix: Open Network tab, manually rename a source, and find the new ID in 'batchexecute'.
+  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=b7Wfje&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+
+  const payload = [null, [sourceId], [[[newTitle]]]];
+
+  const envelope = [
+    'b7Wfje',
+    JSON.stringify(payload),
+    null,
+    'generic'
+  ];
+
+  const formData = new URLSearchParams();
+  formData.set('f.req', JSON.stringify([[envelope]]));
+  formData.set('at', authToken);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+    },
+    body: formData.toString()
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to rename source ${sourceId}`);
+  }
+}
+
+// Update system instruction
+async function updateSystemInstruction(notebookId, newInstruction) {
+  // MAINTENANCE: If syncing instructions fails, the RPC ID 's0tc2d' may have rotated.
+  // To fix: Open Network tab, manually update system instructions, and find the new ID.
+  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=s0tc2d&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20260512.10_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+
+  const payload = [
+    notebookId,
+    [
+      [
+        null, null, null, null, null, null, null,
+        [
+          [2, newInstruction],
+          []
+        ]
+      ]
+    ],
+    [
+      2, null, null,
+      [
+        1, null, null, null, null, null, null, null, null, null, [1]
+      ]
+    ]
+  ];
+
+  const envelope = [
+    's0tc2d',
+    JSON.stringify(payload),
+    null,
+    'generic'
+  ];
+
+  const formData = new URLSearchParams();
+  formData.set('f.req', JSON.stringify([[envelope]]));
+  formData.set('at', authToken);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+    },
+    body: formData.toString()
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to update system instructions`);
+  }
+}
+
+// Create Modal UI
+async function openManageModal() {
+  const notebookId = getNotebookId();
+  if (!notebookId) {
+    alert('Please open a specific notebook first.');
+    return;
+  }
+
+  if (!authToken) {
+    alert('Failed to get authentication token. Please refresh the page and try again.');
+    return;
+  }
+
+  // Remove existing modal if any
+  const existingModal = document.querySelector('.nlm-modal-overlay');
+  if (existingModal) existingModal.remove();
+
+  // Create Overlay
+  const overlay = document.createElement('div');
+  overlay.className = 'nlm-modal-overlay';
+
+  // Create Modal
+  const modal = document.createElement('div');
+  modal.className = 'nlm-modal';
+
+  // Header
+  const header = document.createElement('div');
+  header.className = 'nlm-modal-header';
+  header.innerHTML = `
+    <h2>Manage Sources</h2>
+    <button class="nlm-close-btn" aria-label="Close" title="Close">&times;</button>
+  `;
+  header.querySelector('.nlm-close-btn').onclick = () => overlay.remove();
+
+  // Body
+  const body = document.createElement('div');
+  body.className = 'nlm-modal-body';
+  body.innerHTML = `
+    <div class="nlm-loading">
+      <div class="nlm-spinner"></div>
+      <div>Gathering sources...</div>
+    </div>
+  `;
+
+  // Footer
+  const footer = document.createElement('div');
+  footer.className = 'nlm-modal-footer';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'nlm-btn nlm-btn-secondary';
+  cancelBtn.innerText = 'Cancel';
+  cancelBtn.onclick = () => overlay.remove();
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'nlm-btn nlm-btn-danger';
+  deleteBtn.innerText = 'Delete';
+  deleteBtn.disabled = true;
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(deleteBtn);
+
+  modal.appendChild(header);
+  modal.appendChild(body);
+  modal.appendChild(footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  // Fetch sources
+  try {
+    const sources = await fetchSources(notebookId);
+
+    if (sources.length === 0) {
+      body.innerHTML = '<p>No sources found in this notebook.</p>';
+      return;
+    }
+
+    body.innerHTML = '';
+
+    // Search Bar
+    const searchContainer = document.createElement('div');
+    searchContainer.className = 'nlm-search-container';
+
+    const searchIcon = document.createElement('div');
+    searchIcon.className = 'nlm-search-icon';
+    searchIcon.innerHTML = `
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"></circle>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+    `;
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.placeholder = 'Search sources by name...';
+    searchInput.className = 'nlm-search-input';
+
+    searchContainer.appendChild(searchIcon);
+    searchContainer.appendChild(searchInput);
+    body.appendChild(searchContainer);
+
+    const controls = document.createElement('div');
+    controls.className = 'nlm-controls';
+    body.appendChild(controls);
+
+    const list = document.createElement('div');
+    list.className = 'nlm-source-list';
+
+    const checkboxesData = [];
+
+    // Search Filter Logic
+    searchInput.addEventListener('input', (e) => {
+      const query = e.target.value.toLowerCase();
+      const items = list.querySelectorAll('.nlm-source-item');
+      items.forEach(item => {
+        if (item.dataset.title.includes(query)) {
+          item.style.display = 'flex';
+        } else {
+          item.style.display = 'none';
+        }
+      });
+    });
+
+    sources.forEach(source => {
+      const item = document.createElement('div');
+      item.className = 'nlm-source-item';
+      item.dataset.title = source.title.toLowerCase();
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = `source-${source.id}`;
+      cb.value = source.id;
+
+      const label = document.createElement('label');
+      label.htmlFor = `source-${source.id}`;
+      label.innerText = source.title;
+
+      cb.onchange = () => {
+        updateDeleteButton();
+      };
+
+      item.appendChild(cb);
+      item.appendChild(label);
+      list.appendChild(item);
+      checkboxesData.push({ cb, originalTitle: source.title });
+    });
+
+    body.appendChild(list);
+
+    const updateDeleteButton = () => {
+      const selectedCount = checkboxesData.filter(c => c.cb.checked).length;
+      deleteBtn.disabled = selectedCount === 0;
+      deleteBtn.innerText = selectedCount > 0 ? `Delete (${selectedCount})` : 'Delete';
+    };
+
+    addSmartSelectionControls(
+      controls,
+      () => list.querySelectorAll('.nlm-source-item'),
+      () => checkboxesData,
+      updateDeleteButton
+    );
+
+    // Handle Delete
+    deleteBtn.onclick = async () => {
+      const selectedIds = checkboxesData.filter(c => c.cb.checked).map(c => c.cb.value);
+      if (selectedIds.length === 0) return;
+
+      const confirmOverlay = document.createElement('div');
+      confirmOverlay.className = 'nlm-confirm-overlay';
+      confirmOverlay.innerHTML = `
+        <div class="nlm-confirm-dialog">
+          <h3>Confirm Deletion</h3>
+          <p>Are you sure you want to permanently delete ${selectedIds.length} source(s)? This cannot be undone.</p>
+          <div class="nlm-confirm-actions">
+            <button class="nlm-btn nlm-btn-secondary" id="nlm-cancel-delete">Cancel</button>
+            <button class="nlm-btn nlm-btn-danger" id="nlm-confirm-delete">Delete</button>
+          </div>
+        </div>
+      `;
+      modal.appendChild(confirmOverlay);
+
+      document.getElementById('nlm-cancel-delete').onclick = () => {
+        confirmOverlay.remove();
+      };
+
+      document.getElementById('nlm-confirm-delete').onclick = async () => {
+        confirmOverlay.remove();
+
+        deleteBtn.disabled = true;
+        cancelBtn.disabled = true;
+        Array.from(controls.querySelectorAll('button')).forEach(b => b.disabled = true);
+
+        try {
+          const chunkSize = 5;
+          for (let i = 0; i < selectedIds.length; i += chunkSize) {
+            const chunk = selectedIds.slice(i, i + chunkSize);
+            await Promise.all(chunk.map(id => deleteSource(notebookId, id)));
+            deleteBtn.innerText = `Deleted ${Math.min(i + chunkSize, selectedIds.length)} / ${selectedIds.length}`;
+          }
+
+          // Show success state in modal
+          body.innerHTML = `
+          <div class="nlm-success-state">
+            <div class="nlm-success-icon">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+            </div>
+            <h3>Success</h3>
+            <p>Successfully deleted ${selectedIds.length} source(s).</p>
+          </div>
+        `;
+
+          footer.style.display = 'none';
+          body.style.borderBottom = 'none';
+          body.style.paddingBottom = '0px';
+
+          // Update toolbar button states: if all sources were deleted, disable the buttons
+          const remainingCount = sources.length - selectedIds.length;
+          sourceCountCache[notebookId] = remainingCount > 0;
+          updateKitButtonStates(remainingCount > 0);
+
+          setTimeout(() => {
+            overlay.remove();
+          }, 2000);
+
+        } catch (err) {
+          console.error('Delete error:', err);
+
+          body.innerHTML = `
+          <div class="nlm-success-state">
+            <div class="nlm-success-icon" style="color: var(--nlm-danger); background: rgba(217, 48, 37, 0.1);">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </svg>
+            </div>
+            <h3>Error Deleting Sources</h3>
+            <p>${err.message}</p>
+          </div>
+        `;
+
+          footer.innerHTML = '';
+          const closeBtn = document.createElement('button');
+          closeBtn.className = 'nlm-btn nlm-btn-secondary';
+          closeBtn.innerText = 'Close';
+          closeBtn.onclick = () => overlay.remove();
+          footer.appendChild(closeBtn);
+        }
+      }; // End of inner confirm
+    }; // End of deleteBtn.onclick
+
+  } catch (error) {
+    console.error('Fetch error:', error);
+    body.innerHTML = `<p style="color: red;">Failed to load sources: ${error.message}</p>`;
+  }
+}
+
+// Enables or disables the 3 source-dependent buttons (delete, rename, label).
+// The sync button is always enabled — it works independently of sources.
+function updateKitButtonStates(hasSource) {
+  const deleteBtn = document.getElementById('bulk-delete-btn');
+  const renameBtn = document.getElementById('bulk-rename-btn');
+  const labelBtn = document.getElementById('bulk-label-btn');
+  [deleteBtn, renameBtn, labelBtn].forEach(btn => {
+    if (!btn) return;
+    btn.disabled = !hasSource;
+  });
+}
+
+// Debounced background check: fetches sources once and caches the result.
+// Buttons are enabled/disabled based on whether sources exist.
+function scheduleSourceCheck(notebookId) {
+  if (sourceCheckTimer) clearTimeout(sourceCheckTimer);
+  sourceCheckTimer = setTimeout(async () => {
+    // Return cached result instantly to avoid redundant API calls
+    if (notebookId in sourceCountCache) {
+      updateKitButtonStates(sourceCountCache[notebookId]);
+      return;
+    }
+    // Token may not be ready yet on first paint — retry after another 800ms
+    if (!authToken) {
+      scheduleSourceCheck(notebookId);
+      return;
+    }
+    try {
+      const sources = await fetchSources(notebookId);
+      const hasSources = sources.length > 0;
+      sourceCountCache[notebookId] = hasSources;
+      updateKitButtonStates(hasSources);
+    } catch (e) {
+      // On API error, enable buttons so user isn't blocked
+      updateKitButtonStates(true);
+    }
+  }, 800);
+}
+
+// Create and inject the button
+function injectButton() {
+  const notebookId = getNotebookId();
+  const existingContainer = document.getElementById('nlm-bulk-actions-container');
+
+  if (!notebookId) {
+    if (existingContainer) existingContainer.remove();
+    return;
+  }
+
+  // Find an element containing exactly "Sources"
+  const xpath = "//div[text()='Sources'] | //span[text()='Sources'] | //h2[text()='Sources'] | //h3[text()='Sources']";
+  const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+
+  let targetNode = null;
+  for (let i = 0; i < result.snapshotLength; i++) {
+    const node = result.snapshotItem(i);
+    // Ensure element is visible
+    if (node.offsetParent !== null) {
+      targetNode = node;
+      break;
+    }
+  }
+
+  if (!targetNode) {
+    if (existingContainer) existingContainer.remove();
+    return;
+  }
+
+  // If the container exists, ensure it's still right next to our target node
+  if (existingContainer) {
+    if (existingContainer.previousElementSibling === targetNode) {
+      return; // It's correctly positioned
+    } else {
+      existingContainer.remove(); // Re-inject it in the correct spot
+    }
+  }
+
+  const container = document.createElement('div');
+  container.id = 'nlm-bulk-actions-container';
+  container.className = 'nlm-btn-inline';
+  container.style.display = 'flex';
+  container.style.gap = '4px';
+  container.style.alignItems = 'center';
+
+  // Pencil button (Rename)
+  const renameBtn = document.createElement('button');
+  renameBtn.id = 'bulk-rename-btn';
+  renameBtn.title = 'Bulk Rename Sources';
+  renameBtn.onclick = openRenameModal;
+  renameBtn.className = 'nlm-action-btn rename-btn';
+  renameBtn.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+    </svg>
+  `;
+
+  // Trash button (Delete)
+  const deleteBtn = document.createElement('button');
+  deleteBtn.id = 'bulk-delete-btn';
+  deleteBtn.title = 'Manage / Bulk Delete Sources';
+  deleteBtn.onclick = openManageModal;
+  deleteBtn.className = 'nlm-action-btn delete-btn';
+  deleteBtn.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#d93025" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="3 6 5 6 21 6"></polyline>
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+      <line x1="10" y1="11" x2="10" y2="17"></line>
+      <line x1="14" y1="11" x2="14" y2="17"></line>
+    </svg>
+  `;
+
+  // Sync toggle button
+  const syncBtn = document.createElement('button');
+  syncBtn.id = 'bulk-sync-btn';
+  syncBtn.title = 'Sync System Instructions';
+  syncBtn.onclick = syncInstructions;
+  syncBtn.className = 'nlm-action-btn';
+  syncBtn.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 2v6h-6"></path>
+      <path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path>
+      <path d="M3 22v-6h6"></path>
+      <path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path>
+    </svg>
+  `;
+
+  // Label toggle button
+  const labelBtn = document.createElement('button');
+  labelBtn.id = 'bulk-label-btn';
+  labelBtn.title = 'Bulk Assign Label';
+  labelBtn.onclick = openLabelModal;
+  labelBtn.className = 'nlm-action-btn';
+  labelBtn.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
+      <line x1="7" y1="7" x2="7.01" y2="7"></line>
+    </svg>
+  `;
+
+  container.appendChild(syncBtn);
+  container.appendChild(labelBtn);
+  container.appendChild(renameBtn);
+  container.appendChild(deleteBtn);
+
+  // Start source-dependent buttons as disabled until the background check confirms sources exist
+  deleteBtn.disabled = true;
+  renameBtn.disabled = true;
+  labelBtn.disabled = true;
+
+  targetNode.insertAdjacentElement('afterend', container);
+
+  // Ensure parent aligns the text and the new icons cleanly
+  if (targetNode.parentElement) {
+    targetNode.parentElement.style.display = 'flex';
+    targetNode.parentElement.style.alignItems = 'center';
+  }
+
+  // Kick off background source check to enable buttons if sources are present
+  const nbId = getNotebookId();
+  if (nbId) scheduleSourceCheck(nbId);
+}
+
+// Initialize
+injectTokenScript();
+injectButton();
+
+// Use MutationObserver to ensure the button stays on the page even if React re-renders
+const observer = new MutationObserver(() => {
+  injectButton();
+});
+observer.observe(document.body, { childList: true, subtree: true });
+
+
+// --- RENAME UI LOGIC ---
+async function openRenameModal() {
+  const notebookId = getNotebookId();
+  if (!notebookId) {
+    alert('Please open a specific notebook first.');
+    return;
+  }
+
+  if (!authToken) {
+    alert('Failed to get authentication token. Please refresh the page and try again.');
+    return;
+  }
+
+  // Remove existing modal if any
+  const existingModal = document.querySelector('.nlm-modal-overlay');
+  if (existingModal) existingModal.remove();
+
+  // Create Overlay
+  const overlay = document.createElement('div');
+  overlay.className = 'nlm-modal-overlay';
+
+  // Create Modal
+  const modal = document.createElement('div');
+  modal.className = 'nlm-modal';
+
+  // Header
+  const header = document.createElement('div');
+  header.className = 'nlm-modal-header';
+  header.innerHTML = `
+    <h2>Bulk Rename Sources</h2>
+    <button class="nlm-close-btn" aria-label="Close" title="Close">&times;</button>
+  `;
+  header.querySelector('.nlm-close-btn').onclick = () => overlay.remove();
+
+  // Body
+  const body = document.createElement('div');
+  body.className = 'nlm-modal-body';
+  body.innerHTML = `
+    <div class="nlm-loading">
+      <div class="nlm-spinner"></div>
+      <div>Gathering sources...</div>
+    </div>
+  `;
+
+  // Footer
+  const footer = document.createElement('div');
+  footer.className = 'nlm-modal-footer';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'nlm-btn nlm-btn-secondary';
+  cancelBtn.innerText = 'Cancel';
+  cancelBtn.onclick = () => overlay.remove();
+
+  const renameBtn = document.createElement('button');
+  renameBtn.className = 'nlm-btn nlm-btn-primary';
+  renameBtn.innerText = 'Rename';
+  renameBtn.disabled = true;
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(renameBtn);
+
+  modal.appendChild(header);
+  modal.appendChild(body);
+  modal.appendChild(footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  // Fetch sources
+  try {
+    const sources = await fetchSources(notebookId);
+
+    if (sources.length === 0) {
+      body.innerHTML = '<p>No sources found in this notebook.</p>';
+      return;
+    }
+
+    body.innerHTML = '';
+
+    // Prefix Input Section
+    const prefixContainer = document.createElement('div');
+    prefixContainer.style.marginBottom = '20px';
+    prefixContainer.innerHTML = `
+      <label style="display: block; font-size: 14px; font-weight: 500; margin-bottom: 8px;">Supplier Name (Prefix)</label>
+      <input type="text" id="nlm-prefix-input" class="nlm-search-input" placeholder="e.g. Acme Corp" style="padding-left: 12px;">
+    `;
+    body.appendChild(prefixContainer);
+
+    const prefixInput = prefixContainer.querySelector('#nlm-prefix-input');
+
+    // Search Bar
+    const searchContainer = document.createElement('div');
+    searchContainer.className = 'nlm-search-container';
+    searchContainer.innerHTML = `
+      <div class="nlm-search-icon">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+      </div>
+      <input type="text" id="nlm-search-input" class="nlm-search-input" placeholder="Search sources...">
+    `;
+    body.appendChild(searchContainer);
+    const searchInput = searchContainer.querySelector('#nlm-search-input');
+
+    // Controls
+    const controls = document.createElement('div');
+    controls.className = 'nlm-controls';
+    body.appendChild(controls);
+
+    const list = document.createElement('div');
+    list.className = 'nlm-source-list';
+
+    const checkboxes = [];
+    const previewSpans = [];
+
+    // Create source items
+    sources.forEach(source => {
+      const item = document.createElement('div');
+      item.className = 'nlm-source-item';
+      item.dataset.title = source.title.toLowerCase();
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = `rename-${source.id}`;
+      cb.value = source.id;
+
+      const label = document.createElement('label');
+      label.htmlFor = `rename-${source.id}`;
+
+      const originalNameSpan = document.createElement('span');
+      originalNameSpan.innerText = source.title;
+
+      const previewNameSpan = document.createElement('span');
+      previewNameSpan.className = 'nlm-preview-name';
+      previewNameSpan.innerText = `Preview: ${source.title}`;
+
+      label.appendChild(originalNameSpan);
+      label.appendChild(previewNameSpan);
+
+      cb.onchange = () => {
+        updateRenameButton();
+      };
+
+      item.appendChild(cb);
+      item.appendChild(label);
+      list.appendChild(item);
+      checkboxes.push({ cb, originalTitle: source.title, previewSpan: previewNameSpan });
+    });
+
+    body.appendChild(list);
+
+    const updatePreviews = () => {
+      const prefix = prefixInput.value.trim();
+      checkboxes.forEach(item => {
+        const newName = prefix ? `${prefix} - ${item.originalTitle}` : item.originalTitle;
+        item.previewSpan.innerText = `Preview: ${newName}`;
+      });
+    };
+
+    const updateRenameButton = () => {
+      const selectedCount = checkboxes.filter(c => c.cb.checked).length;
+      renameBtn.disabled = selectedCount === 0;
+      renameBtn.innerText = selectedCount > 0 ? `Rename (${selectedCount})` : 'Rename';
+    };
+
+    prefixInput.addEventListener('input', updatePreviews);
+
+    searchInput.addEventListener('input', (e) => {
+      const query = e.target.value.toLowerCase();
+      const items = list.querySelectorAll('.nlm-source-item');
+      items.forEach(item => {
+        if (item.dataset.title.includes(query)) {
+          item.style.display = 'flex';
+        } else {
+          item.style.display = 'none';
+        }
+      });
+    });
+
+    addSmartSelectionControls(
+      controls,
+      () => list.querySelectorAll('.nlm-source-item'),
+      () => checkboxes,
+      updateRenameButton
+    );
+
+    // Handle Rename Execution
+    renameBtn.onclick = async () => {
+      const selectedItems = checkboxes.filter(item => item.cb.checked);
+      if (selectedItems.length === 0) return;
+
+      const prefix = prefixInput.value.trim();
+
+      renameBtn.disabled = true;
+      cancelBtn.disabled = true;
+      prefixInput.disabled = true;
+      Array.from(controls.querySelectorAll('button')).forEach(b => b.disabled = true);
+
+      try {
+        const chunkSize = 5;
+        for (let i = 0; i < selectedItems.length; i += chunkSize) {
+          const chunk = selectedItems.slice(i, i + chunkSize);
+          await Promise.all(chunk.map(item => {
+            const newName = prefix ? `${prefix} - ${item.originalTitle}` : item.originalTitle;
+            return renameSource(notebookId, item.cb.value, newName);
+          }));
+          renameBtn.innerText = `Renamed ${Math.min(i + chunkSize, selectedItems.length)} / ${selectedItems.length}`;
+        }
+
+        // Show success state in modal
+        body.innerHTML = `
+          <div class="nlm-success-state">
+            <div class="nlm-success-icon">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+            </div>
+            <h3>Success</h3>
+            <p>Successfully renamed ${selectedItems.length} source(s).</p>
+          </div>
+        `;
+
+        footer.style.display = 'none';
+        body.style.borderBottom = 'none';
+        body.style.paddingBottom = '0px';
+
+        setTimeout(() => {
+          overlay.remove();
+        }, 2000);
+
+      } catch (err) {
+        console.error('Rename error:', err);
+
+        body.innerHTML = `
+          <div class="nlm-success-state">
+            <div class="nlm-success-icon" style="color: var(--nlm-danger); background: rgba(217, 48, 37, 0.1);">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </svg>
+            </div>
+            <h3>Error Renaming Sources</h3>
+            <p>${err.message}</p>
+          </div>
+        `;
+
+        footer.innerHTML = '';
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'nlm-btn nlm-btn-secondary';
+        closeBtn.innerText = 'Close';
+        closeBtn.onclick = () => overlay.remove();
+        footer.appendChild(closeBtn);
+      }
+    };
+
+  } catch (error) {
+    console.error('Fetch error:', error);
+    body.innerHTML = `<p style="color: red;">Failed to load sources: ${error.message}</p>`;
+  }
+}
+
+// --- SMART SELECTION HELPER ---
+function addSmartSelectionControls(controlsContainer, getListItems, getCheckboxData, onSelectionChange) {
+  const selectAllBtn = document.createElement('button');
+  selectAllBtn.className = 'nlm-link-btn';
+  selectAllBtn.innerText = 'Select All';
+
+  const deselectAllBtn = document.createElement('button');
+  deselectAllBtn.className = 'nlm-link-btn';
+  deselectAllBtn.innerText = 'Deselect All';
+
+  const selectNoPrefixBtn = document.createElement('button');
+  selectNoPrefixBtn.className = 'nlm-link-btn';
+  selectNoPrefixBtn.innerText = 'Select No Prefix';
+
+  const selectDuplicatesBtn = document.createElement('button');
+  selectDuplicatesBtn.className = 'nlm-link-btn';
+  selectDuplicatesBtn.innerText = 'Select Duplicates';
+
+  controlsContainer.appendChild(selectAllBtn);
+  controlsContainer.appendChild(deselectAllBtn);
+  controlsContainer.appendChild(selectNoPrefixBtn);
+  controlsContainer.appendChild(selectDuplicatesBtn);
+
+  selectAllBtn.onclick = () => {
+    getListItems().forEach((item, index) => {
+      if (item.style.display !== 'none') getCheckboxData()[index].cb.checked = true;
+    });
+    onSelectionChange();
+  };
+
+  deselectAllBtn.onclick = () => {
+    getListItems().forEach((item, index) => {
+      if (item.style.display !== 'none') getCheckboxData()[index].cb.checked = false;
+    });
+    onSelectionChange();
+  };
+
+  selectNoPrefixBtn.onclick = () => {
+    getListItems().forEach((item, index) => {
+      if (item.style.display !== 'none') {
+        const title = getCheckboxData()[index].originalTitle;
+        getCheckboxData()[index].cb.checked = !title.includes(' - ');
+      }
+    });
+    onSelectionChange();
+  };
+
+  selectDuplicatesBtn.onclick = () => {
+    const seen = new Set();
+    getListItems().forEach((item, index) => {
+      if (item.style.display !== 'none') {
+        const title = getCheckboxData()[index].originalTitle.toLowerCase().trim();
+        if (seen.has(title)) {
+          getCheckboxData()[index].cb.checked = true;
+        } else {
+          seen.add(title);
+          getCheckboxData()[index].cb.checked = false;
+        }
+      }
+    });
+    onSelectionChange();
+    onSelectionChange();
+  };
+}
+
+// --- SYNC INSTRUCTIONS (ONE-CLICK) ---
+async function syncInstructions() {
+  const notebookId = getNotebookId();
+  if (!notebookId) {
+    alert('Please open a specific notebook first.');
+    return;
+  }
+
+  if (!authToken) {
+    alert('Failed to get authentication token. Please refresh the page and try again.');
+    return;
+  }
+
+  const existingModal = document.querySelector('.nlm-modal-overlay');
+  if (existingModal) existingModal.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'nlm-modal-overlay';
+  overlay.innerHTML = `
+    <div class="nlm-modal" style="text-align: center; padding: 32px;">
+      <h3 style="margin: 0 0 16px 0; color: var(--nlm-text-primary);">Syncing Instructions...</h3>
+      <p style="color: var(--nlm-text-secondary); margin: 0;" id="sync-status">Fetching latest instructions from server</p>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const statusMsg = document.getElementById('sync-status');
+
+  try {
+    // Note: The specific commit hash was intentionally removed from this URL
+    // so that it always fetches the absolute latest version saved to the Gist!
+    const url = 'https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1bedfe76caf59f3/raw/gistfile1.txt';
+
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Failed to fetch from URL');
+    const text = await response.text();
+
+    statusMsg.innerText = 'Updating Notebook...';
+    await updateSystemInstruction(notebookId, text);
+
+    statusMsg.innerText = 'Success! Instructions updated.';
+    statusMsg.style.color = '#0f9d58';
+
+    setTimeout(() => {
+      overlay.remove();
+    }, 1500);
+
+  } catch (err) {
+    console.error(err);
+    statusMsg.innerText = `Error: ${err.message}`;
+    statusMsg.style.color = '#d93025';
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'nlm-btn-secondary';
+    closeBtn.innerText = 'Close';
+    closeBtn.style.marginTop = '16px';
+    closeBtn.onclick = () => overlay.remove();
+    overlay.firstElementChild.appendChild(closeBtn);
+  }
+}
+
+// --- LABELLING LOGIC ---
+async function fetchLabels(notebookId) {
+  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=agX4Bc&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+
+  const envelope = [
+    'agX4Bc',
+    JSON.stringify([[2], notebookId, null, null, []]),
+    null,
+    'generic'
+  ];
+
+  const formData = new URLSearchParams();
+  formData.set('f.req', JSON.stringify([[envelope]]));
+  formData.set('at', authToken);
+
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body: formData.toString() });
+  if (!response.ok) throw new Error('Failed to fetch labels');
+
+  const text = await response.text();
+  const labelObjects = [];
+  const sourceToLabelMap = {};
+
+  // We must fetch sources first to know which UUIDs are Source IDs vs Label IDs
+  const sources = await fetchSources(notebookId);
+  const sourceIds = new Set(sources.map(s => s.id));
+
+  try {
+    const cleanText = text.replace(/^\)\]\}'\s*/, '');
+    const lines = cleanText.split('\n');
+
+    for (const line of lines) {
+      if (line.includes('wrb.fr') && line.includes('agX4Bc')) {
+        let innerDataStr = null;
+        try {
+          const parsedLine = JSON.parse(line);
+          if (Array.isArray(parsedLine) && parsedLine.length > 0) {
+            const inner = Array.isArray(parsedLine[0]) ? parsedLine[0] : parsedLine;
+            if (inner[0] === 'wrb.fr' && inner[1] === 'agX4Bc') {
+              innerDataStr = inner[2];
+            }
+          }
+        } catch (e) {
+          const match = line.match(/\["wrb\.fr","agX4Bc","(.*?)",/);
+          if (match) innerDataStr = JSON.parse('"' + match[1] + '"');
+        }
+
+        if (innerDataStr) {
+          const labelData = JSON.parse(innerDataStr);
+          console.log("NotebookLM Extension: RAW Label API Data:", labelData);
+
+          function recursiveFind(arr) {
+            if (!Array.isArray(arr)) return;
+
+            let id = null;
+            let name = null;
+
+            // Check elements in the array
+            for (let i = 0; i < arr.length; i++) {
+              let item = arr[i];
+              let potentialId = null;
+
+              if (typeof item === 'string' && item.match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i)) {
+                potentialId = item;
+              } else if (Array.isArray(item) && typeof item[0] === 'string' && item[0].match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i)) {
+                potentialId = item[0];
+              }
+
+              if (potentialId && potentialId !== notebookId && !sourceIds.has(potentialId)) {
+                id = potentialId;
+                // Find nearest string that is not a UUID
+                for (let j = 0; j < arr.length; j++) {
+                  if (typeof arr[j] === 'string' && arr[j] !== id && arr[j].trim() !== '' && !arr[j].match(/^[a-f0-9]{8}-/)) {
+                    name = arr[j];
+                    break;
+                  }
+                }
+                break;
+              }
+            }
+
+            if (id && name) {
+              if (!labelObjects.find(l => l.id === id)) {
+                labelObjects.push({ id, name });
+              }
+              // If we found a label, scan this entire sub-array for source IDs to build the mapping
+              function extractSourceIds(subArr) {
+                if (!Array.isArray(subArr)) return;
+                for (let item of subArr) {
+                  if (typeof item === 'string' && sourceIds.has(item)) {
+                    if (!sourceToLabelMap[item]) sourceToLabelMap[item] = [];
+                    if (!sourceToLabelMap[item].includes(id)) sourceToLabelMap[item].push(id);
+                  } else if (Array.isArray(item)) {
+                    extractSourceIds(item);
+                  }
+                }
+              }
+              extractSourceIds(arr);
+            }
+
+            for (const item of arr) {
+              recursiveFind(item);
+            }
+          }
+
+          recursiveFind(labelData);
+          console.log("NotebookLM Extension: Parsed Labels:", labelObjects);
+          console.log("NotebookLM Extension: Source to Label Map:", sourceToLabelMap);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to parse labels', err);
+  }
+
+  return { labels: labelObjects, sourceToLabelMap, sources };
+}
+
+async function updateLabelAssignment(notebookId, sourceId, labelId, action) {
+  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=le8sX&source-path=%2Fnotebook%2F${notebookId}&bl=boq_labs-tailwind-frontend_20260513.08_p0&f.sid=-4482901012118920597&hl=en-GB&_reqid=${generateReqId()}&rt=c`;
+
+  // Google's internal array format for le8sX:
+  // Add: [[ null, AddedSources ]]
+  // Remove: [[ null, null, RemovedSources ]]
+  let actionPayload;
+  if (action === 'add') {
+    actionPayload = [null, [[sourceId]]];
+  } else {
+    actionPayload = [null, null, [[sourceId]]];
+  }
+
+  const payload = [[2], notebookId, labelId, [actionPayload]];
+
+  const envelope = [
+    'le8sX',
+    JSON.stringify(payload),
+    null,
+    'generic'
+  ];
+
+  const formData = new URLSearchParams();
+  formData.set('f.req', JSON.stringify([[envelope]]));
+  formData.set('at', authToken);
+
+  console.log(`NotebookLM Extension: ${action === 'add' ? 'Adding' : 'Removing'} Source ${sourceId} for Label ${labelId}`);
+
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body: formData.toString() });
+  if (!response.ok) {
+    throw new Error(`HTTP Error: ${response.status}`);
+  }
+
+  const text = await response.text();
+  console.log(`NotebookLM Extension: Assign Response for ${sourceId}:`, text);
+}
+
+async function openLabelModal() {
+  const notebookId = getNotebookId();
+  if (!notebookId) { alert('Please open a specific notebook first.'); return; }
+  if (!authToken) { alert('Failed to get authentication token. Please refresh the page and try again.'); return; }
+
+  const existingModal = document.querySelector('.nlm-modal-overlay');
+  if (existingModal) existingModal.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'nlm-modal-overlay';
+  const modal = document.createElement('div');
+  modal.className = 'nlm-modal';
+  modal.style.maxWidth = '900px';
+  modal.style.width = '90vw';
+  const header = document.createElement('div');
+  header.className = 'nlm-modal-header';
+  header.innerHTML = `
+    <h2>Bulk Assign Label</h2>
+    <button class="nlm-close-btn" aria-label="Close" title="Close">&times;</button>
+  `;
+  header.querySelector('.nlm-close-btn').onclick = () => overlay.remove();
+
+  const body = document.createElement('div');
+  body.className = 'nlm-modal-body';
+  body.innerHTML = `<div class="nlm-loading"><div class="nlm-spinner"></div><div>Gathering sources and labels...</div></div>`;
+
+  const footer = document.createElement('div');
+  footer.className = 'nlm-modal-footer';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'nlm-btn nlm-btn-secondary';
+  cancelBtn.innerText = 'Cancel';
+  cancelBtn.onclick = () => overlay.remove();
+
+  const assignBtn = document.createElement('button');
+  assignBtn.className = 'nlm-btn nlm-btn-primary';
+  assignBtn.innerText = 'Assign Label';
+  assignBtn.disabled = true;
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(assignBtn);
+  modal.appendChild(header);
+  modal.appendChild(body);
+  modal.appendChild(footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  try {
+    const { labels, sourceToLabelMap, sources } = await fetchLabels(notebookId);
+
+    if (sources.length === 0) {
+      body.innerHTML = '<p>No sources found in this notebook.</p>';
+      return;
+    }
+
+    body.innerHTML = '';
+
+    // Create Flex Container
+    const mainContent = document.createElement('div');
+    mainContent.style.display = 'flex';
+    mainContent.style.gap = '20px';
+    mainContent.style.height = '400px';
+
+    // --- LEFT COLUMN: SOURCES ---
+    const leftCol = document.createElement('div');
+    leftCol.style.flex = '3';
+    leftCol.style.display = 'flex';
+    leftCol.style.flexDirection = 'column';
+    leftCol.style.borderRight = '1px solid var(--nlm-border)';
+    leftCol.style.paddingRight = '20px';
+
+    const sourceHeader = document.createElement('div');
+    sourceHeader.style.fontWeight = '500';
+    sourceHeader.style.marginBottom = '10px';
+    sourceHeader.innerText = '1. Select Sources';
+    leftCol.appendChild(sourceHeader);
+
+    const searchContainer = document.createElement('div');
+    searchContainer.className = 'nlm-search-container';
+    searchContainer.innerHTML = `
+      <div class="nlm-search-icon">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+      </div>
+      <input type="text" id="nlm-search-input" class="nlm-search-input" placeholder="Search sources...">
+    `;
+    leftCol.appendChild(searchContainer);
+    const searchInput = searchContainer.querySelector('#nlm-search-input');
+
+    const controls = document.createElement('div');
+    controls.className = 'nlm-controls';
+    leftCol.appendChild(controls);
+
+    const sourceList = document.createElement('div');
+    sourceList.className = 'nlm-source-list';
+    sourceList.style.flex = '1';
+    sourceList.style.overflowY = 'auto';
+
+    const sourceCheckboxesData = [];
+
+    searchInput.addEventListener('input', (e) => {
+      const query = e.target.value.toLowerCase();
+      const items = sourceList.querySelectorAll('.nlm-source-item');
+      items.forEach(item => {
+        if (item.dataset.title.includes(query)) item.style.display = 'flex';
+        else item.style.display = 'none';
+      });
+    });
+
+    sources.forEach(source => {
+      const item = document.createElement('div');
+      item.className = 'nlm-source-item';
+      item.dataset.title = source.title.toLowerCase();
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = `source-${source.id}`;
+      cb.value = source.id;
+
+      const labelEl = document.createElement('label');
+      labelEl.htmlFor = `source-${source.id}`;
+
+      const updateLabelText = () => {
+        const existingLabelIds = sourceToLabelMap[source.id] || [];
+        const existingLabelNames = existingLabelIds.map(lid => labels.find(l => l.id === lid)?.name).filter(Boolean);
+        labelEl.innerText = source.title + (existingLabelNames.length > 0 ? ` (In: ${existingLabelNames.join(', ')})` : '');
+      };
+      updateLabelText();
+
+      cb.onchange = () => updateButtons();
+
+      item.appendChild(cb);
+      item.appendChild(labelEl);
+      sourceList.appendChild(item);
+      sourceCheckboxesData.push({ cb, originalTitle: source.title, updateLabelText });
+    });
+
+    leftCol.appendChild(sourceList);
+    mainContent.appendChild(leftCol);
+
+    // --- RIGHT COLUMN: LABELS ---
+    const rightCol = document.createElement('div');
+    rightCol.style.flex = '2';
+    rightCol.style.display = 'flex';
+    rightCol.style.flexDirection = 'column';
+
+    const labelHeader = document.createElement('div');
+    labelHeader.style.fontWeight = '500';
+    labelHeader.style.marginBottom = '10px';
+    labelHeader.innerText = '2. Select Labels';
+    rightCol.appendChild(labelHeader);
+
+    const labelList = document.createElement('div');
+    labelList.className = 'nlm-source-list';
+    labelList.style.flex = '1';
+    labelList.style.overflowY = 'auto';
+
+    const labelCheckboxesData = [];
+    labels.forEach(labelObj => {
+      const item = document.createElement('div');
+      item.className = 'nlm-source-item';
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = `dest-label-${labelObj.id}`;
+      cb.value = labelObj.id;
+
+      const labelEl = document.createElement('label');
+      labelEl.htmlFor = `dest-label-${labelObj.id}`;
+      labelEl.innerText = labelObj.name;
+
+      cb.onchange = () => updateButtons();
+
+      item.appendChild(cb);
+      item.appendChild(labelEl);
+      labelList.appendChild(item);
+      labelCheckboxesData.push({ cb });
+    });
+
+    rightCol.appendChild(labelList);
+    mainContent.appendChild(rightCol);
+
+    body.appendChild(mainContent);
+
+    // --- FOOTER BUTTONS ---
+    footer.innerHTML = '';
+
+    const statusText = document.createElement('div');
+    statusText.style.flex = '1';
+    statusText.style.textAlign = 'left';
+    statusText.style.color = '#666';
+    statusText.style.fontSize = '13px';
+    statusText.style.fontWeight = '500';
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'nlm-btn nlm-btn-danger';
+    removeBtn.style.marginRight = '8px';
+
+    const assignBtn2 = document.createElement('button');
+    assignBtn2.className = 'nlm-btn nlm-btn-primary';
+    assignBtn2.style.marginRight = '8px';
+
+    const doneBtn = document.createElement('button');
+    doneBtn.className = 'nlm-btn nlm-btn-secondary';
+    doneBtn.innerText = 'Done & Reload';
+    doneBtn.onclick = () => window.location.reload();
+
+    footer.appendChild(statusText);
+    footer.appendChild(removeBtn);
+    footer.appendChild(assignBtn2);
+    footer.appendChild(doneBtn);
+
+    const updateButtons = () => {
+      const selectedSources = sourceCheckboxesData.filter(c => c.cb.checked).length;
+      const selectedLabels = labelCheckboxesData.filter(c => c.cb.checked).length;
+      const enabled = selectedSources > 0 && selectedLabels > 0;
+
+      assignBtn2.disabled = !enabled;
+      removeBtn.disabled = !enabled;
+
+      assignBtn2.innerText = enabled ? `Add to ${selectedLabels} Label(s)` : 'Add to Labels';
+      removeBtn.innerText = enabled ? `Remove from ${selectedLabels} Label(s)` : 'Remove from Labels';
+    };
+
+    addSmartSelectionControls(controls, () => sourceList.querySelectorAll('.nlm-source-item'), () => sourceCheckboxesData, updateButtons);
+    updateButtons();
+
+    const executeAction = async (action) => {
+      const selectedSourceIds = sourceCheckboxesData.filter(c => c.cb.checked).map(c => c.cb.value);
+      const selectedLabelIds = labelCheckboxesData.filter(c => c.cb.checked).map(c => c.cb.value);
+
+      assignBtn2.disabled = true;
+      removeBtn.disabled = true;
+      doneBtn.disabled = true;
+      statusText.innerText = `${action === 'add' ? 'Assigning' : 'Removing'} sources...`;
+      statusText.style.color = '#666';
+
+      let successCount = 0;
+
+      for (const labelId of selectedLabelIds) {
+        for (const sourceId of selectedSourceIds) {
+          try {
+            await updateLabelAssignment(notebookId, sourceId, labelId, action);
+
+            if (!sourceToLabelMap[sourceId]) sourceToLabelMap[sourceId] = [];
+            if (action === 'add') {
+               if (!sourceToLabelMap[sourceId].includes(labelId)) sourceToLabelMap[sourceId].push(labelId);
+            } else {
+               sourceToLabelMap[sourceId] = sourceToLabelMap[sourceId].filter(id => id !== labelId);
+            }
+
+            const sourceData = sourceCheckboxesData.find(c => c.cb.value === sourceId);
+            if (sourceData) sourceData.updateLabelText();
+
+            successCount++;
+          } catch (e) {
+            console.error(e);
+          }
+        }
+      }
+
+      statusText.innerText = `Success! Processed ${successCount} operation(s).`;
+      statusText.style.color = 'var(--nlm-primary)';
+
+      sourceCheckboxesData.forEach(c => c.cb.checked = false);
+
+      updateButtons();
+      doneBtn.disabled = false;
+    };
+
+    assignBtn2.onclick = () => executeAction('add');
+    removeBtn.onclick = () => executeAction('remove');
+
+  } catch (error) {
+    console.error('Fetch error:', error);
+    body.innerHTML = `<p style="color: red;">Failed to load data: ${error.message}</p>`;
+  }
+}
