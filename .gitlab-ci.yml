@@ -9,7 +9,7 @@ build_extension:
   script:
     - echo "Packaging the extension..."
     - apk add --no-cache zip
-    - zip -r extension.zip . -x "*.git*" ".gitlab-ci.yml" "node_modules/*" "extension.zip"
+    - zip -r extension.zip * -x "node_modules/*" "extension.zip"
   artifacts:
     paths:
       - extension.zip
