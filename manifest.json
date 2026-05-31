@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GPO - Ariba Automation & NotebookLM Kit",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Automatically downloads Ariba attachments into supplier folders and uploads them to NotebookLM. Also includes the NotebookLM Kit: bulk delete, rename, label, and one-click system instruction sync.",
   "permissions": [
     "scripting",
