@@ -22,7 +22,10 @@ deploy_to_chrome_web_store:
   dependencies:
     - build_extension
   script:
-    - echo "Uploading to Chrome Web Store..."
+    - echo "=== Verifying ZIP contents ==="
+    - apk add --no-cache unzip
+    - unzip -l extension.zip | head -40
+    - echo "=== Uploading to Chrome Web Store ==="
     - npm install -g chrome-webstore-upload-cli
     - chrome-webstore-upload upload --source extension.zip --extension-id $EXTENSION_ID --publisher-id $PUBLISHER_ID
     - chrome-webstore-upload publish --extension-id $EXTENSION_ID --publisher-id $PUBLISHER_ID
