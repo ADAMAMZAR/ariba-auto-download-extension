@@ -9,7 +9,7 @@ build_extension:
   script:
     - echo "Packaging the extension..."
     - apk add --no-cache zip
-    - zip -r extension.zip * -x "node_modules/*" "extension.zip"
+    - zip -r extension.zip . -x "*.git*" ".gitlab-ci.yml" "node_modules/*" "extension.zip"
   artifacts:
     paths:
       - extension.zip
@@ -22,10 +22,7 @@ deploy_to_chrome_web_store:
   dependencies:
     - build_extension
   script:
-    - echo "=== Verifying ZIP contents ==="
-    - apk add --no-cache unzip
-    - unzip -l extension.zip | head -40
-    - echo "=== Uploading to Chrome Web Store ==="
+    - echo "Uploading to Chrome Web Store..."
     - npm install -g chrome-webstore-upload-cli
     - chrome-webstore-upload upload --source extension.zip --extension-id $EXTENSION_ID --publisher-id $PUBLISHER_ID
     - chrome-webstore-upload publish --extension-id $EXTENSION_ID --publisher-id $PUBLISHER_ID

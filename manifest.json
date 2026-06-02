@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "GPO - Ariba Automation & NotebookLM Kit",
+  "name": "GPO - Automatic Certificate Checker",
   "version": "2.0.1",
   "description": "Automatically downloads Ariba attachments into supplier folders and uploads them to NotebookLM. Also includes the NotebookLM Kit: bulk delete, rename, label, and one-click system instruction sync.",
   "permissions": [
@@ -33,16 +33,25 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://notebooklm.google.com/*"],
-      "js": ["notebooklm_kit.js"],
-      "css": ["notebooklm_kit.css"]
+      "matches": [
+        "*://notebooklm.google.com/*"
+      ],
+      "js": [
+        "notebooklm_kit.js"
+      ],
+      "css": [
+        "notebooklm_kit.css"
+      ]
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["nlm_inject.js"],
-      "matches": ["*://notebooklm.google.com/*"]
+      "resources": [
+        "nlm_inject.js"
+      ],
+      "matches": [
+        "*://notebooklm.google.com/*"
+      ]
     }
   ]
 }
-
