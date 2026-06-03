@@ -29,7 +29,7 @@
     }
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background/background.js"
   },
   "content_scripts": [
     {
@@ -37,17 +37,20 @@
         "*://notebooklm.google.com/*"
       ],
       "js": [
-        "notebooklm_kit.js"
+        "shared/constants.js",
+        "notebooklm/notebooklm_kit.js"
       ],
       "css": [
-        "notebooklm_kit.css"
+        "notebooklm/notebooklm_kit.css"
       ]
     }
   ],
   "web_accessible_resources": [
     {
       "resources": [
-        "nlm_inject.js"
+        "notebooklm/nlm_inject.js",
+        "shared/constants.js",
+        "notebooklm/nlm_runner.js"
       ],
       "matches": [
         "*://notebooklm.google.com/*"

@@ -60,7 +60,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
-        files: ['content.js']
+        files: ['content/content.js']
       });
 
     } catch (err) {

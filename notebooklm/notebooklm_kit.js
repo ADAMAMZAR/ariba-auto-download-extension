@@ -15,7 +15,7 @@ let sourceCheckTimer = null;
 // Inject script to get tokens from the main page context
 function injectTokenScript() {
   const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('nlm_inject.js');
+  script.src = chrome.runtime.getURL('notebooklm/nlm_inject.js');
   script.onload = () => script.remove();
   (document.head || document.documentElement).appendChild(script);
 }

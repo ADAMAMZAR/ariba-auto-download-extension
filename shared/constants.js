@@ -1,0 +1,43 @@
+// ============================================================
+// constants.js — Single source of truth for all magic values
+//
+// Loaded in three contexts:
+//   1. background/background.js (service worker) → via importScripts('../shared/constants.js')
+//   2. notebooklm/notebooklm_kit.js (content script) → loaded first in manifest content_scripts
+//   3. notebooklm/nlm_runner.js (MAIN world injection) → injected via files:[] before nlm_runner.js
+//
+// Uses var so values land on globalThis and are accessible across
+// all script files loaded in the same context.
+// ============================================================
+
+// ── NotebookLM batchexecute RPC IDs ──────────────────────────────────
+// ⚠️  MAINTENANCE: These IDs rotate without notice. If a feature starts
+//     failing with a 400 error, open DevTools → Network → filter
+//     "batchexecute" → manually perform the affected action → find the
+//     new ID. Update ONLY the constant below — no other file needs to change.
+var RPC_FETCH_SOURCES     = 'rLM1Ne'; // fetchSources()       — list all sources in a notebook
+var RPC_DELETE_SOURCE     = 'tGMBJ';  // deleteSource()       — delete a single source
+var RPC_RENAME_SOURCE     = 'b7Wfje'; // renameSource()       — rename a single source
+var RPC_SYNC_INSTRUCTIONS = 's0tc2d'; // updateSystemInstruction() / nlm_runner sync step
+var RPC_REGISTER_FILES    = 'o4cbdc'; // nlm_runner upload step — register file slots
+var RPC_FETCH_LABELS      = 'agX4Bc'; // fetchLabels()        — list all labels
+var RPC_UPDATE_LABEL      = 'le8sX';  // updateLabelAssignment() — add/remove label from source
+
+// ── External URLs ─────────────────────────────────────────────────────
+var NLM_API_BASE = 'https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute';
+var NLM_UPLOAD_BASE = 'https://notebooklm.google.com/upload/_/';
+
+// System instructions are fetched from this GitHub Gist so they can be
+// updated without releasing a new extension version.
+var GIST_URL = 'https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1bedfe76caf59f3/raw/gistfile1.txt';
+
+// ── Extension behaviour ───────────────────────────────────────────────
+// Root folder used for all downloads (matches the extension name shown in Chrome)
+var DOWNLOAD_ROOT = 'GPO - Automatic Certificate Checker';
+
+// Extension popup window dimensions (pixels)
+var POPUP_WIDTH  = 400;
+var POPUP_HEIGHT = 520;
+
+// Max files processed in parallel during a NotebookLM upload batch
+var UPLOAD_BATCH_SIZE = 5;
