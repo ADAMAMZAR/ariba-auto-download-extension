@@ -46,9 +46,9 @@
   const getWizData = () => {
     const data = window.WIZ_global_data || {};
     return {
-      bl:   data.cfb2h  || 'boq_labs-tailwind-frontend_20260518.10_p0',
-      fSid: data.Fdrif  || '-5077533628963748752',
-      at:   data.SNlM0e
+      bl: data.cfb2h || 'boq_labs-tailwind-frontend_20260518.10_p0',
+      fSid: data.Fdrif || '-5077533628963748752',
+      at: data.SNlM0e
     };
   };
 
@@ -61,11 +61,11 @@
     const syncKey = `synced_${notebookId}`;
     if (!sessionStorage.getItem(syncKey)) {
       sendStatus('Syncing system instructions to NotebookLM...');
-      const authToken = window.WIZ_global_data?.SNlM0e;
+      const wiz = getWizData();
 
-      if (authToken) {
+      if (wiz.at) {
         try {
-          const url = `${NLM_API_BASE}?rpcids=${RPC_SYNC_INSTRUCTIONS}&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20260512.10_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+          const url = `${NLM_API_BASE}?rpcids=${RPC_SYNC_INSTRUCTIONS}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
 
           const payload = [
             notebookId,
@@ -89,7 +89,7 @@
           const envelope = [RPC_SYNC_INSTRUCTIONS, JSON.stringify(payload), null, 'generic'];
           const formData = new URLSearchParams();
           formData.set('f.req', JSON.stringify([[envelope]]));
-          formData.set('at', authToken);
+          formData.set('at', wiz.at);
 
           const response = await fetch(url, {
             method: 'POST',
@@ -107,7 +107,7 @@
           sendStatus('Error syncing system instructions: ' + err.message, true);
         }
       } else {
-        sendStatus('Auth token not found for syncing.', true);
+        sendStatus('Auth token (WIZ SNlM0e) not found for syncing.', true);
       }
     }
   }

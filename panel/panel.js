@@ -14,19 +14,24 @@ document.addEventListener('DOMContentLoaded', () => {
     logEntries.scrollTop = logEntries.scrollHeight;
   }
 
-  // Restore saved URL
-  chrome.storage.local.get('notebooklmUrl', r => {
+  // ── Restore user prefs from local storage (persists across browser restarts) ──
+  // Both the URL field and the checkbox state are user preferences → chrome.storage.local.
+  // Only ephemeral per-run state (notebooklmConfig) lives in chrome.storage.session.
+  chrome.storage.local.get(['notebooklmUrl', 'connectToNotebooklm'], r => {
     if (r.notebooklmUrl) notebooklmUrlInput.value = r.notebooklmUrl;
+    if (typeof r.connectToNotebooklm === 'boolean') {
+      connectCheckbox.checked = r.connectToNotebooklm;
+    }
+    notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
   });
+
   notebooklmUrlInput.addEventListener('input', () => {
     chrome.storage.local.set({ notebooklmUrl: notebooklmUrlInput.value });
   });
 
-  // Set initial display based on checkbox state
-  notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
-
   connectCheckbox.addEventListener('change', () => {
     notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
+    chrome.storage.local.set({ connectToNotebooklm: connectCheckbox.checked });
   });
 
   downloadBtn.addEventListener('click', async () => {
@@ -54,8 +59,15 @@ document.addEventListener('DOMContentLoaded', () => {
       const aribaTab = aribaTabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
       addLog(`Found Ariba tab: ${aribaTab.title || aribaTab.url}`, 'info');
 
+      // Store ephemeral per-run config in session storage (cleared on browser restart)
       await chrome.storage.session.set({
         notebooklmConfig: { connectToNotebooklm, notebooklmUrl }
+      });
+
+      // Inject toast CSS before the script so classes are available on first call
+      await chrome.scripting.insertCSS({
+        target: { tabId: aribaTab.id, allFrames: true },
+        files: ['content/content.css']
       });
 
       chrome.scripting.executeScript({

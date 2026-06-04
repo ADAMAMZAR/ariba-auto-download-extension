@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GPO - Automatic Certificate Checker",
-  "version": "2.0.3",
+  "version": "2.1.0",
   "description": "Automatically expands and downloads attachments from Ariba, saving them in supplier-named folders.",
   "permissions": [
     "scripting",
@@ -37,6 +37,7 @@
         "*://notebooklm.google.com/*"
       ],
       "js": [
+        "shared/logger.js",
         "shared/constants.js",
         "notebooklm/notebooklm_kit.js"
       ],
@@ -48,12 +49,21 @@
   "web_accessible_resources": [
     {
       "resources": [
+        "shared/logger.js",
         "notebooklm/nlm_inject.js",
         "shared/constants.js",
         "notebooklm/nlm_runner.js"
       ],
       "matches": [
         "*://notebooklm.google.com/*"
+      ]
+    },
+    {
+      "resources": [
+        "content/content.css"
+      ],
+      "matches": [
+        "*://*.ariba.com/*"
       ]
     }
   ]

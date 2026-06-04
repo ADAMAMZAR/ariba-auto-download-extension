@@ -1,53 +1,36 @@
 (async function () {
 
+  // ── Re-entrant guard — prevent double-execution if injected twice ─────
+  if (window.__aribaAutomationRunning) {
+    console.warn('[Ariba Ext] Automation already in progress, skipping duplicate injection.');
+    return;
+  }
+  window.__aribaAutomationRunning = true;
+
   // ── Toast notifications ───────────────────────────────────────────────
+  // Styles live in content/content.css (injected via panel.js insertCSS).
   function showToast(text, isError = false) {
     let container = document.getElementById('ariba-toast-container');
     if (!container) {
       container = document.createElement('div');
       container.id = 'ariba-toast-container';
-      container.style.cssText = `
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        z-index: 999999;
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      `;
       document.body.appendChild(container);
     }
 
     const toast = document.createElement('div');
-    toast.style.cssText = `
-      background: ${isError ? '#ef4444' : '#1e293b'};
-      color: #ffffff;
-      padding: 12px 18px;
-      border-radius: 8px;
-      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-      font-size: 14px;
-      font-weight: 500;
-      opacity: 0;
-      transform: translateY(10px);
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      min-width: 250px;
-      max-width: 350px;
-      border-left: 4px solid ${isError ? '#f87171' : '#3b82f6'};
-    `;
+    toast.className = 'ariba-toast' + (isError ? ' ariba-toast--error' : '');
     toast.textContent = text;
     container.appendChild(toast);
 
-    // Fade in
+    // Trigger CSS enter transition
     requestAnimationFrame(() => {
-      toast.style.opacity = '1';
-      toast.style.transform = 'translateY(0)';
+      toast.classList.add('ariba-toast--visible');
     });
 
-    // Fade out and remove
+    // Trigger CSS exit transition, then remove
     setTimeout(() => {
-      toast.style.opacity = '0';
-      toast.style.transform = 'translateY(-10px)';
+      toast.classList.remove('ariba-toast--visible');
+      toast.classList.add('ariba-toast--exit');
       setTimeout(() => toast.remove(), 300);
     }, 4000);
   }
@@ -149,5 +132,7 @@
   } catch (err) {
     showToast('Error: ' + err.message, true);
     console.error('[Ariba Ext] Error running automation:', err);
+  } finally {
+    window.__aribaAutomationRunning = false;
   }
 })();

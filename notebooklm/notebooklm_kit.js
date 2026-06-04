@@ -48,11 +48,24 @@ function generateReqId() {
   return Math.floor(Math.random() * 90000) + 10000;
 }
 
+// Read dynamic WIZ build params from the page.
+// The fallback values are the last known-good values — update them when
+// they stop working (DevTools → Network → any batchexecute request → check bl= and f.sid=).
+function getWizData() {
+  const data = window.WIZ_global_data || {};
+  return {
+    bl:   data.cfb2h  || 'boq_labs-tailwind-frontend_20260518.10_p0',
+    fSid: data.Fdrif  || '-5077533628963748752',
+    at:   data.SNlM0e || authToken
+  };
+}
+
 // Fetch all sources for the current notebook
 async function fetchSources(notebookId) {
   // MAINTENANCE: If fetching sources fails (e.g. 400 error), the RPC ID 'rLM1Ne' may have rotated.
   // To fix: Open Network tab, refresh NotebookLM, look for 'batchexecute' and find the new ID.
-  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=rLM1Ne&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}&nlm_kit=true`;
+  const wiz = getWizData();
+  const url = `${NLM_API_BASE}?rpcids=${RPC_FETCH_SOURCES}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}&nlm_kit=true`;
 
   const envelope = [
     'rLM1Ne',
@@ -151,7 +164,8 @@ async function fetchSources(notebookId) {
 async function deleteSource(notebookId, sourceId) {
   // MAINTENANCE: If deletion fails, the RPC ID 'tGMBJ' may have rotated.
   // To fix: Open Network tab, manually delete a source, and find the new ID in 'batchexecute'.
-  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=tGMBJ&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+  const wiz = getWizData();
+  const url = `${NLM_API_BASE}?rpcids=${RPC_DELETE_SOURCE}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
 
   const formattedIds = [[[sourceId]], [2]];
 
@@ -183,7 +197,8 @@ async function deleteSource(notebookId, sourceId) {
 async function renameSource(notebookId, sourceId, newTitle) {
   // MAINTENANCE: If renaming fails, the RPC ID 'b7Wfje' may have rotated.
   // To fix: Open Network tab, manually rename a source, and find the new ID in 'batchexecute'.
-  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=b7Wfje&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+  const wiz = getWizData();
+  const url = `${NLM_API_BASE}?rpcids=${RPC_RENAME_SOURCE}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
 
   const payload = [null, [sourceId], [[[newTitle]]]];
 
@@ -215,7 +230,8 @@ async function renameSource(notebookId, sourceId, newTitle) {
 async function updateSystemInstruction(notebookId, newInstruction) {
   // MAINTENANCE: If syncing instructions fails, the RPC ID 's0tc2d' may have rotated.
   // To fix: Open Network tab, manually update system instructions, and find the new ID.
-  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=s0tc2d&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20260512.10_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+  const wiz = getWizData();
+  const url = `${NLM_API_BASE}?rpcids=${RPC_SYNC_INSTRUCTIONS}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
 
   const payload = [
     notebookId,
@@ -260,6 +276,53 @@ async function updateSystemInstruction(notebookId, newInstruction) {
   }
 }
 
+// ── Modal factory ────────────────────────────────────────────────────────
+// Creates a standard NLM modal and appends it to the page.
+// Returns { overlay, modal, body, footer } for the caller to populate.
+//
+// @param {string} title — heading shown in the modal header
+// @param {string} [loadingText] — placeholder shown while data loads
+// @returns {{ overlay: HTMLElement, modal: HTMLElement, body: HTMLElement, footer: HTMLElement }}
+function createModal(title, loadingText = 'Gathering sources...') {
+  // Remove existing modal if any
+  const existing = document.querySelector('.nlm-modal-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'nlm-modal-overlay';
+
+  const modal = document.createElement('div');
+  modal.className = 'nlm-modal';
+
+  const header = document.createElement('div');
+  header.className = 'nlm-modal-header';
+  header.innerHTML = `
+    <h2>${title}</h2>
+    <button class="nlm-close-btn" aria-label="Close" title="Close">&times;</button>
+  `;
+  header.querySelector('.nlm-close-btn').onclick = () => overlay.remove();
+
+  const body = document.createElement('div');
+  body.className = 'nlm-modal-body';
+  body.innerHTML = `
+    <div class="nlm-loading">
+      <div class="nlm-spinner"></div>
+      <div>${loadingText}</div>
+    </div>
+  `;
+
+  const footer = document.createElement('div');
+  footer.className = 'nlm-modal-footer';
+
+  modal.appendChild(header);
+  modal.appendChild(body);
+  modal.appendChild(footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  return { overlay, modal, body, footer };
+}
+
 // Create Modal UI
 async function openManageModal() {
   const notebookId = getNotebookId();
@@ -273,40 +336,7 @@ async function openManageModal() {
     return;
   }
 
-  // Remove existing modal if any
-  const existingModal = document.querySelector('.nlm-modal-overlay');
-  if (existingModal) existingModal.remove();
-
-  // Create Overlay
-  const overlay = document.createElement('div');
-  overlay.className = 'nlm-modal-overlay';
-
-  // Create Modal
-  const modal = document.createElement('div');
-  modal.className = 'nlm-modal';
-
-  // Header
-  const header = document.createElement('div');
-  header.className = 'nlm-modal-header';
-  header.innerHTML = `
-    <h2>Manage Sources</h2>
-    <button class="nlm-close-btn" aria-label="Close" title="Close">&times;</button>
-  `;
-  header.querySelector('.nlm-close-btn').onclick = () => overlay.remove();
-
-  // Body
-  const body = document.createElement('div');
-  body.className = 'nlm-modal-body';
-  body.innerHTML = `
-    <div class="nlm-loading">
-      <div class="nlm-spinner"></div>
-      <div>Gathering sources...</div>
-    </div>
-  `;
-
-  // Footer
-  const footer = document.createElement('div');
-  footer.className = 'nlm-modal-footer';
+  const { overlay, modal, body, footer } = createModal('Manage Sources');
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'nlm-btn nlm-btn-secondary';
@@ -320,12 +350,6 @@ async function openManageModal() {
 
   footer.appendChild(cancelBtn);
   footer.appendChild(deleteBtn);
-
-  modal.appendChild(header);
-  modal.appendChild(body);
-  modal.appendChild(footer);
-  overlay.appendChild(modal);
-  document.body.appendChild(overlay);
 
   // Fetch sources
   try {
@@ -704,40 +728,7 @@ async function openRenameModal() {
     return;
   }
 
-  // Remove existing modal if any
-  const existingModal = document.querySelector('.nlm-modal-overlay');
-  if (existingModal) existingModal.remove();
-
-  // Create Overlay
-  const overlay = document.createElement('div');
-  overlay.className = 'nlm-modal-overlay';
-
-  // Create Modal
-  const modal = document.createElement('div');
-  modal.className = 'nlm-modal';
-
-  // Header
-  const header = document.createElement('div');
-  header.className = 'nlm-modal-header';
-  header.innerHTML = `
-    <h2>Bulk Rename Sources</h2>
-    <button class="nlm-close-btn" aria-label="Close" title="Close">&times;</button>
-  `;
-  header.querySelector('.nlm-close-btn').onclick = () => overlay.remove();
-
-  // Body
-  const body = document.createElement('div');
-  body.className = 'nlm-modal-body';
-  body.innerHTML = `
-    <div class="nlm-loading">
-      <div class="nlm-spinner"></div>
-      <div>Gathering sources...</div>
-    </div>
-  `;
-
-  // Footer
-  const footer = document.createElement('div');
-  footer.className = 'nlm-modal-footer';
+  const { overlay, modal, body, footer } = createModal('Bulk Rename Sources');
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'nlm-btn nlm-btn-secondary';
@@ -751,12 +742,6 @@ async function openRenameModal() {
 
   footer.appendChild(cancelBtn);
   footer.appendChild(renameBtn);
-
-  modal.appendChild(header);
-  modal.appendChild(body);
-  modal.appendChild(footer);
-  overlay.appendChild(modal);
-  document.body.appendChild(overlay);
 
   // Fetch sources
   try {
@@ -1079,7 +1064,8 @@ async function syncInstructions() {
 
 // --- LABELLING LOGIC ---
 async function fetchLabels(notebookId) {
-  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=agX4Bc&_reqid=${generateReqId()}&bl=boq_labs-tailwind-frontend_20250129.00_p0&f.sid=-7121977511756781186&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
+  const wiz = getWizData();
+  const url = `${NLM_API_BASE}?rpcids=${RPC_FETCH_LABELS}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
 
   const envelope = [
     'agX4Bc',
@@ -1195,7 +1181,8 @@ async function fetchLabels(notebookId) {
 }
 
 async function updateLabelAssignment(notebookId, sourceId, labelId, action) {
-  const url = `https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=le8sX&source-path=%2Fnotebook%2F${notebookId}&bl=boq_labs-tailwind-frontend_20260513.08_p0&f.sid=-4482901012118920597&hl=en-GB&_reqid=${generateReqId()}&rt=c`;
+  const wiz = getWizData();
+  const url = `${NLM_API_BASE}?rpcids=${RPC_UPDATE_LABEL}&source-path=%2Fnotebook%2F${notebookId}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en-GB&_reqid=${generateReqId()}&rt=c`;
 
   // Google's internal array format for le8sX:
   // Add: [[ null, AddedSources ]]
@@ -1236,47 +1223,10 @@ async function openLabelModal() {
   if (!notebookId) { alert('Please open a specific notebook first.'); return; }
   if (!authToken) { alert('Failed to get authentication token. Please refresh the page and try again.'); return; }
 
-  const existingModal = document.querySelector('.nlm-modal-overlay');
-  if (existingModal) existingModal.remove();
-
-  const overlay = document.createElement('div');
-  overlay.className = 'nlm-modal-overlay';
-  const modal = document.createElement('div');
-  modal.className = 'nlm-modal';
+  const { overlay, modal, body, footer } = createModal('Bulk Assign Label', 'Gathering sources and labels...');
+  // Label modal needs extra width for its two-column layout
   modal.style.maxWidth = '900px';
   modal.style.width = '90vw';
-  const header = document.createElement('div');
-  header.className = 'nlm-modal-header';
-  header.innerHTML = `
-    <h2>Bulk Assign Label</h2>
-    <button class="nlm-close-btn" aria-label="Close" title="Close">&times;</button>
-  `;
-  header.querySelector('.nlm-close-btn').onclick = () => overlay.remove();
-
-  const body = document.createElement('div');
-  body.className = 'nlm-modal-body';
-  body.innerHTML = `<div class="nlm-loading"><div class="nlm-spinner"></div><div>Gathering sources and labels...</div></div>`;
-
-  const footer = document.createElement('div');
-  footer.className = 'nlm-modal-footer';
-
-  const cancelBtn = document.createElement('button');
-  cancelBtn.className = 'nlm-btn nlm-btn-secondary';
-  cancelBtn.innerText = 'Cancel';
-  cancelBtn.onclick = () => overlay.remove();
-
-  const assignBtn = document.createElement('button');
-  assignBtn.className = 'nlm-btn nlm-btn-primary';
-  assignBtn.innerText = 'Assign Label';
-  assignBtn.disabled = true;
-
-  footer.appendChild(cancelBtn);
-  footer.appendChild(assignBtn);
-  modal.appendChild(header);
-  modal.appendChild(body);
-  modal.appendChild(footer);
-  overlay.appendChild(modal);
-  document.body.appendChild(overlay);
 
   try {
     const { labels, sourceToLabelMap, sources } = await fetchLabels(notebookId);

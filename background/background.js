@@ -1,5 +1,7 @@
-// Load shared constants (RPC IDs, URLs, behaviour values) before anything else
+// Load shared logger first, then constants
+importScripts('../shared/logger.js');
 importScripts('../shared/constants.js');
+
 
 // Open standalone panel window when extension icon is clicked
 chrome.action.onClicked.addListener(async () => {
@@ -245,7 +247,7 @@ async function maybeOpenNotebookLM(supplier) {
         }
       });
     } catch (e) {
-      // Failed to inject message bridge
+      console.warn('[Ariba Ext] Failed to inject NLM message bridge:', e?.message ?? e);
     }
 
     // 2. Pass args to the runner script by writing them onto window in the MAIN world.
@@ -302,7 +304,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             notifyAribaTab(val.aribaTabId, request.text, request.error);
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('[Ariba Ext] Session storage relay failed:', e?.message ?? e);
+      }
     }
 
     if (request.action === 'downloadFiles') {
