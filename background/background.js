@@ -240,7 +240,7 @@ async function maybeOpenNotebookLM(supplier) {
                   text: event.data.text,
                   error: event.data.error,
                   done: event.data.done
-                }).catch(() => {});
+                }).catch(() => { });
               }
             });
           }
@@ -310,6 +310,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.action === 'downloadFiles') {
+      // ╔══════════════════════════════════════════════════════════════╗
+      // ║  LEGAL REVIEW LOCK — delete this entire block to re-enable  ║
+      // ╚══════════════════════════════════════════════════════════════╝
+      if (true) {
+        notifyPanel('This extension is under review by the Gamuda Legal Team and cannot be used at this time.', true, true);
+        return;
+      }
+      // ══════════════════════════════════════════════════════════════
+
       const s = cleanName(request.supplierName || 'Ariba');
       const tabId = sender.tab?.id;
 

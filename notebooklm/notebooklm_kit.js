@@ -54,9 +54,9 @@ function generateReqId() {
 function getWizData() {
   const data = window.WIZ_global_data || {};
   return {
-    bl:   data.cfb2h  || 'boq_labs-tailwind-frontend_20260518.10_p0',
-    fSid: data.Fdrif  || '-5077533628963748752',
-    at:   data.SNlM0e || authToken
+    bl: data.cfb2h || 'boq_labs-tailwind-frontend_20260518.10_p0',
+    fSid: data.Fdrif || '-5077533628963748752',
+    at: data.SNlM0e || authToken
   };
 }
 
@@ -1429,9 +1429,9 @@ async function openLabelModal() {
 
             if (!sourceToLabelMap[sourceId]) sourceToLabelMap[sourceId] = [];
             if (action === 'add') {
-               if (!sourceToLabelMap[sourceId].includes(labelId)) sourceToLabelMap[sourceId].push(labelId);
+              if (!sourceToLabelMap[sourceId].includes(labelId)) sourceToLabelMap[sourceId].push(labelId);
             } else {
-               sourceToLabelMap[sourceId] = sourceToLabelMap[sourceId].filter(id => id !== labelId);
+              sourceToLabelMap[sourceId] = sourceToLabelMap[sourceId].filter(id => id !== labelId);
             }
 
             const sourceData = sourceCheckboxesData.find(c => c.cb.value === sourceId);
