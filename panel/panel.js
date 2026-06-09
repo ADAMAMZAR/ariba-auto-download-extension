@@ -17,41 +17,41 @@ document.addEventListener('DOMContentLoaded', () => {
   // ╔══════════════════════════════════════════════════════════════╗
   // ║  LEGAL REVIEW LOCK — delete this entire block to re-enable  ║
   // ╚══════════════════════════════════════════════════════════════╝
-  const EXTENSION_LOCKED = true;
-  const LOCK_TITLE = 'Extension Temporarily Unavailable';
-  const LOCK_MESSAGE = 'This extension is currently under review by the Gamuda Legal Team and cannot be used at this time.';
+  // const EXTENSION_LOCKED = true;
+  // const LOCK_TITLE = 'Extension Temporarily Unavailable';
+  // const LOCK_MESSAGE = 'This extension is currently under review by the Gamuda Legal Team and cannot be used at this time.';
 
-  if (EXTENSION_LOCKED) {
-    downloadBtn.disabled = true;
-    connectCheckbox.disabled = true;
+  // if (EXTENSION_LOCKED) {
+  //   downloadBtn.disabled = true;
+  //   connectCheckbox.disabled = true;
 
-    const overlay = document.createElement('div');
-    overlay.id = 'lock-overlay';
-    overlay.style.cssText = [
-      'position:fixed', 'inset:0', 'z-index:9999',
-      'display:flex', 'flex-direction:column', 'align-items:center', 'justify-content:center',
-      'background:rgba(15,15,20,0.93)', 'padding:24px', 'text-align:center',
-      'font-family:system-ui,sans-serif'
-    ].join(';');
+  //   const overlay = document.createElement('div');
+  //   overlay.id = 'lock-overlay';
+  //   overlay.style.cssText = [
+  //     'position:fixed', 'inset:0', 'z-index:9999',
+  //     'display:flex', 'flex-direction:column', 'align-items:center', 'justify-content:center',
+  //     'background:rgba(15,15,20,0.93)', 'padding:24px', 'text-align:center',
+  //     'font-family:system-ui,sans-serif'
+  //   ].join(';');
 
-    const icon = document.createElement('div');
-    icon.textContent = '🔒';
-    icon.style.cssText = 'font-size:40px;margin-bottom:14px;';
+  //   const icon = document.createElement('div');
+  //   icon.textContent = '🔒';
+  //   icon.style.cssText = 'font-size:40px;margin-bottom:14px;';
 
-    const title = document.createElement('div');
-    title.textContent = LOCK_TITLE;
-    title.style.cssText = 'color:#f59e0b;font-size:15px;font-weight:700;margin-bottom:10px;';
+  //   const title = document.createElement('div');
+  //   title.textContent = LOCK_TITLE;
+  //   title.style.cssText = 'color:#f59e0b;font-size:15px;font-weight:700;margin-bottom:10px;';
 
-    const msg = document.createElement('div');
-    msg.textContent = LOCK_MESSAGE;
-    msg.style.cssText = 'color:#cbd5e1;font-size:12px;line-height:1.6;max-width:320px;';
+  //   const msg = document.createElement('div');
+  //   msg.textContent = LOCK_MESSAGE;
+  //   msg.style.cssText = 'color:#cbd5e1;font-size:12px;line-height:1.6;max-width:320px;';
 
-    overlay.appendChild(icon);
-    overlay.appendChild(title);
-    overlay.appendChild(msg);
-    document.body.appendChild(overlay);
-    return; // ← stops all event listener setup below
-  }
+  //   overlay.appendChild(icon);
+  //   overlay.appendChild(title);
+  //   overlay.appendChild(msg);
+  //   document.body.appendChild(overlay);
+  //   return; // ← stops all event listener setup below
+  // }
   // ══════════════════════════════════════════════════════════════
 
 

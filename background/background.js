@@ -313,10 +313,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       // ╔══════════════════════════════════════════════════════════════╗
       // ║  LEGAL REVIEW LOCK — delete this entire block to re-enable  ║
       // ╚══════════════════════════════════════════════════════════════╝
-      if (true) {
-        notifyPanel('This extension is under review by the Gamuda Legal Team and cannot be used at this time.', true, true);
-        return;
-      }
+      // if (true) {
+      //   notifyPanel('This extension is under review by the Gamuda Legal Team and cannot be used at this time.', true, true);
+      //   return;
+      // }
       // ══════════════════════════════════════════════════════════════
 
       const s = cleanName(request.supplierName || 'Ariba');
