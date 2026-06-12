@@ -37,6 +37,17 @@ chrome.action.onClicked.addListener(async () => {
 // Mirrors exactly how DevTools "Capture full size screenshot" works:
 //   expand viewport → screenshot → restore viewport
 // -----------------------------------------------------------------------
+
+/** Promisified wrapper for chrome.debugger.sendCommand. */
+function debuggerCmd(target, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(target, method, params, (result) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(result);
+    });
+  });
+}
+
 async function captureFullPageScreenshot(tabId, supplierName) {
   const target = { tabId };
 
@@ -52,21 +63,10 @@ async function captureFullPageScreenshot(tabId, supplierName) {
     });
 
     // 2. Enable Page domain
-    await new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand(target, 'Page.enable', {}, () => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve();
-      });
-    });
+    await debuggerCmd(target, 'Page.enable');
 
     // 3. Get full page dimensions
-    const metrics = await new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics', {}, (result) => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve(result);
-      });
-    });
-
+    const metrics = await debuggerCmd(target, 'Page.getLayoutMetrics');
     const { width, height } = metrics.cssContentSize || metrics.contentSize;
     const fullW = Math.ceil(width);
     const fullH = Math.ceil(height);
@@ -75,48 +75,30 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 
     // 4. Expand the viewport to the full page size (this is the key step —
     //    without this, captureBeyondViewport tiles the same viewport repeatedly)
-    await new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
-        width: fullW,
-        height: fullH,
-        deviceScaleFactor: 1,
-        mobile: false
-      }, () => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve();
-      });
+    await debuggerCmd(target, 'Emulation.setDeviceMetricsOverride', {
+      width: fullW, height: fullH, deviceScaleFactor: 1, mobile: false
     });
 
     // Let the layout reflow settle after resize
     await new Promise(r => setTimeout(r, 300));
 
     // 5. Capture — viewport is now the full page, so no clip needed
-    const screenshotResult = await new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
-        format: 'png',
-        captureBeyondViewport: false
-      }, (result) => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve(result);
-      });
+    const screenshotResult = await debuggerCmd(target, 'Page.captureScreenshot', {
+      format: 'png', captureBeyondViewport: false
     });
 
     // 6. Restore original viewport
-    await new Promise(resolve => {
-      chrome.debugger.sendCommand(target, 'Emulation.clearDeviceMetricsOverride', {}, () => resolve());
-    });
+    await debuggerCmd(target, 'Emulation.clearDeviceMetricsOverride');
 
     // 7. Detach debugger
-    await new Promise(resolve => {
-      chrome.debugger.detach(target, () => resolve());
-    });
+    await new Promise(resolve => chrome.debugger.detach(target, () => resolve()));
 
     if (!screenshotResult?.data) {
       notifyAribaTab(tabId, 'Screenshot capture returned no data.', true);
       return null;
     }
 
-    // 8. Save as PNG into the supplier folder inside the extension root folder
+    // 8. Save as PNG into the supplier folder
     const dataUrl = 'data:image/png;base64,' + screenshotResult.data;
     const filename = `${DOWNLOAD_ROOT}/${supplierName}/${supplierName} - screenshot.png`;
 
@@ -132,7 +114,7 @@ async function captureFullPageScreenshot(tabId, supplierName) {
 
   } catch (err) {
     // Always detach on error to release the tab
-    chrome.debugger.detach(target, () => { });
+    chrome.debugger.detach(target, () => {});
     notifyAribaTab(tabId, 'Screenshot error: ' + err.message, true);
     return null;
   }
@@ -151,7 +133,12 @@ function notifyPanel(text, error = false, done = false) {
   chrome.runtime.sendMessage({ type: 'status', text, error, done }).catch(() => { });
 }
 
-function cleanName(n) { return n.replace(/[\/\\?%*:|"<>]/g, '-'); }
+function cleanName(n) {
+  return n
+    .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem characters
+    .replace(/\.+$/, '')              // Windows: names cannot end with a period
+    .trim();                           // no leading/trailing spaces
+}
 
 function uint8ArrayToBase64(bytes) {
   let binary = '';
@@ -168,6 +155,51 @@ async function blobToDataUrl(blob) {
   const bytes = new Uint8Array(arrayBuffer);
   const base64 = uint8ArrayToBase64(bytes);
   return `data:${blob.type};base64,${base64}`;
+}
+
+// -----------------------------------------------------------------------
+// Fetch helpers — timeout + retry
+// -----------------------------------------------------------------------
+
+/** Fetch with an AbortController timeout. Optionally accepts an external stop signal. */
+async function fetchWithTimeout(url, timeoutMs = 30000, stopSignal = null) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  // If the external stop signal fires, abort this fetch immediately
+  const onStop = () => controller.abort();
+  if (stopSignal) stopSignal.addEventListener('abort', onStop, { once: true });
+
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } catch (err) {
+    if (stopSignal?.aborted) throw new Error('Stopped by user.');
+    if (err.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (stopSignal) stopSignal.removeEventListener('abort', onStop);
+  }
+}
+
+/**
+ * Fetch with automatic retry on failure.
+ * Reports each retry attempt via notifyAribaTab if tabId / filename are provided.
+ * Respects stopSignal — throws immediately if stop is requested between retries.
+ */
+async function fetchWithRetry(url, { retries = 2, timeoutMs = 30000, delayMs = 2000, tabId = null, filename = '', stopSignal = null } = {}) {
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    if (stopSignal?.aborted) throw new Error('Stopped by user.');
+    try {
+      const resp = await fetchWithTimeout(url, timeoutMs, stopSignal);
+      if (resp.ok) return resp;
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    } catch (err) {
+      if (err.message === 'Stopped by user.' || attempt > retries) throw err;
+      if (tabId) notifyAribaTab(tabId, `Retry ${attempt}/${retries} for "${filename}"...`);
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
 }
 
 // -----------------------------------------------------------------------
@@ -290,6 +322,30 @@ async function maybeOpenNotebookLM(supplier) {
 }
 
 // -----------------------------------------------------------------------
+// Stop signal — AbortController + stored Ariba tab ID
+// -----------------------------------------------------------------------
+let _stopController = null;   // AbortController for the active run
+let _activeAribaTabId = null; // Ariba tab that initiated the run
+
+function triggerStop() {
+  // 1. Abort all in-flight fetches
+  if (_stopController) {
+    _stopController.abort();
+    _stopController = null;
+  }
+  // 2. Tell the Ariba content script to stop its own loops
+  if (_activeAribaTabId) {
+    chrome.tabs.sendMessage(_activeAribaTabId, { action: 'stopAutomation' }).catch(() => {});
+    _activeAribaTabId = null;
+  }
+}
+
+function clearStopSignal() {
+  _stopController = null;
+  _activeAribaTabId = null;
+}
+
+// -----------------------------------------------------------------------
 // Message handler
 // -----------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -309,72 +365,153 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
     }
 
+    if (request.action === 'stopAutomation') {
+      triggerStop(); // aborts fetches + messages the Ariba tab directly
+      return;
+    }
+
     if (request.action === 'downloadFiles') {
-      // ╔══════════════════════════════════════════════════════════════╗
-      // ║  LEGAL REVIEW LOCK — delete this entire block to re-enable  ║
-      // ╚══════════════════════════════════════════════════════════════╝
-      // if (true) {
-      //   notifyPanel('This extension is under review by the Gamuda Legal Team and cannot be used at this time.', true, true);
-      //   return;
-      // }
-      // ══════════════════════════════════════════════════════════════
+      const AUTOMATION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+      let timeoutHandle;
+      let supplierKey = null; // hoisted so catch block can clear session state
 
-      const s = cleanName(request.supplierName || 'Ariba');
-      const tabId = sender.tab?.id;
+      // Create a fresh AbortController for this run and store the Ariba tab ID
+      // so triggerStop() can reach the content script directly.
+      _stopController = new AbortController();
+      _activeAribaTabId = sender.tab?.id ?? null;
+      const stopSignal = _stopController.signal;
 
-      // Queue local downloads and fetch them in memory for NotebookLM
-      const filesForNotebook = [];
-      for (const file of (request.files || [])) {
-        chrome.downloads.download({
-          url: file.url,
-          filename: `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(file.filename)}`,
-          saveAs: false
-        });
+      // Overall timeout guard
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error('Automation timed out after 3 minutes. Please try again.'));
+        }, AUTOMATION_TIMEOUT_MS);
+      });
 
-        try {
-          const resp = await fetch(file.url);
-          if (resp.ok) {
-            const blob = await resp.blob();
-            const dataUrl = await blobToDataUrl(blob);
-            filesForNotebook.push({
-              filename: `${s} - ${cleanName(file.filename)}`,
-              dataUrl: dataUrl,
-              mimeType: blob.type
-            });
-          } else {
-            notifyAribaTab(tabId, `Failed to fetch file: ${file.filename}`, true);
+      // Stop signal as a promise leg in the race
+      const stopPromise = new Promise((_, reject) => {
+        stopSignal.addEventListener('abort', () => reject(new Error('Stopped by user.')), { once: true });
+      });
+
+      try {
+        await Promise.race([timeoutPromise, stopPromise, (async () => {
+
+          const s = cleanName(request.supplierName || 'Ariba');
+          supplierKey = s; // expose to outer catch
+          const tabId = sender.tab?.id;
+
+          // Check NotebookLM config FIRST — skip all fetch() work if NLM is disabled
+          const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
+          const nlmEnabled = notebooklmConfig?.connectToNotebooklm === true;
+
+          // ── Disk downloads (always) ──────────────────────────────────────
+          const files = request.files || [];
+          for (const file of files) {
+            const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(file.filename)}`;
+            chrome.downloads.download({ url: file.url, filename: destFilename, saveAs: false },
+              (downloadId) => {
+                if (chrome.runtime.lastError || downloadId === undefined) {
+                  notifyAribaTab(tabId, `Download failed to start: ${file.filename}`, true);
+                  return;
+                }
+                // Watch for interruption / failure
+                const onChanged = (delta) => {
+                  if (delta.id !== downloadId) return;
+                  if (delta.state?.current === 'interrupted') {
+                    notifyAribaTab(tabId,
+                      `Download interrupted: ${file.filename}` +
+                      (delta.error?.current ? ` (${delta.error.current})` : ''), true);
+                    chrome.downloads.onChanged.removeListener(onChanged);
+                  } else if (delta.state?.current === 'complete') {
+                    chrome.downloads.onChanged.removeListener(onChanged);
+                  }
+                };
+                chrome.downloads.onChanged.addListener(onChanged);
+                // Safety: remove listener after 5 minutes
+                setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 300_000);
+              }
+            );
           }
-        } catch (err) {
-          notifyAribaTab(tabId, `Error fetching file: ${file.filename}`, true);
-        }
+
+          // ── In-memory fetch for NotebookLM (only when NLM is enabled) ───
+          const filesForNotebook = [];
+          if (nlmEnabled) {
+            for (let idx = 0; idx < files.length; idx++) {
+              if (stopSignal.aborted) throw new Error('Stopped by user.');
+              const file = files[idx];
+              notifyAribaTab(tabId, `Fetching file ${idx + 1}/${files.length}: ${file.filename}...`);
+              try {
+                const resp = await fetchWithRetry(file.url, {
+                  retries: 2,
+                  timeoutMs: 30_000,
+                  delayMs: 2000,
+                  tabId,
+                  filename: file.filename,
+                  stopSignal
+                });
+                const blob = await resp.blob();
+                const dataUrl = await blobToDataUrl(blob);
+                filesForNotebook.push({
+                  filename: `${s} - ${cleanName(file.filename)}`,
+                  dataUrl,
+                  mimeType: blob.type
+                });
+              } catch (err) {
+                if (err.message === 'Stopped by user.') throw err; // propagate stop
+                notifyAribaTab(tabId,
+                  `Failed to fetch "${file.filename}" after retries: ${err.message}`, true);
+              }
+            }
+          }
+
+          if (stopSignal.aborted) throw new Error('Stopped by user.');
+
+          notifyAribaTab(tabId,
+            `Queued ${files.length} file(s) for download. Taking full-page screenshot...`);
+
+          // Hide toasts so they don't appear in the screenshot
+          if (tabId) chrome.tabs.sendMessage(tabId, { action: 'hideToasts' }).catch(() => {});
+
+          let screenshotDataUrl = null;
+          if (tabId) {
+            screenshotDataUrl = await captureFullPageScreenshot(tabId, s);
+          } else {
+            notifyAribaTab(tabId, 'Could not determine Ariba tab for screenshot.', true);
+          }
+
+          // Restore toasts
+          if (tabId) chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
+
+          if (screenshotDataUrl && nlmEnabled) {
+            filesForNotebook.push({
+              filename: `${s} - screenshot.png`,
+              dataUrl: screenshotDataUrl,
+              mimeType: 'image/png'
+            });
+          }
+
+          const state = await getState(s);
+          state.config = notebooklmConfig || null;
+          state.filesDone = true;
+          state.filesForNotebook = filesForNotebook;
+          state.aribaTabId = tabId;
+          await setState(s, state);
+          await maybeOpenNotebookLM(s);
+
+        })()]); // end Promise.race
+      } catch (err) {
+        // Covers timeout, stop-by-user, and unexpected throws
+        const tabId = sender.tab?.id;
+        if (tabId) chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
+        const isStopped = err.message === 'Stopped by user.';
+        notifyAribaTab(tabId, isStopped ? 'Download stopped by user.' : 'Error: ' + err.message, true);
+        notifyPanel(isStopped ? 'Stopped by user.' : 'Error: ' + err.message, true, true);
+        // Clear any stale session state so the next run starts clean
+        if (supplierKey) clearState(supplierKey).catch(() => {});
+      } finally {
+        clearTimeout(timeoutHandle);
+        clearStopSignal();
       }
-
-      notifyAribaTab(tabId, `Queued ${(request.files || []).length} file(s). Taking full-page screenshot...`);
-
-      // Capture full-page screenshot AFTER kicking off downloads
-      let screenshotDataUrl = null;
-      if (tabId) {
-        screenshotDataUrl = await captureFullPageScreenshot(tabId, s);
-      } else {
-        notifyAribaTab(tabId, 'Could not determine Ariba tab for screenshot.', true);
-      }
-
-      if (screenshotDataUrl) {
-        filesForNotebook.push({
-          filename: `${s} - screenshot.png`,
-          dataUrl: screenshotDataUrl,
-          mimeType: 'image/png'
-        });
-      }
-
-      const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
-      const state = await getState(s);
-      state.config = notebooklmConfig || null;
-      state.filesDone = true;
-      state.filesForNotebook = filesForNotebook;
-      state.aribaTabId = tabId;
-      await setState(s, state);
-      await maybeOpenNotebookLM(s);
     }
 
   })();

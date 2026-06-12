@@ -66,6 +66,20 @@ button:disabled {
   cursor: not-allowed;
 }
 
+.btn-danger {
+  background-color: #d93025;
+  margin-top: 0;
+}
+
+.btn-danger:hover {
+  background-color: #b3261e;
+}
+
+.btn-danger:disabled {
+  background-color: #f28b82;
+  cursor: not-allowed;
+}
+
 .status {
   font-size: 12px;
   color: #137333;

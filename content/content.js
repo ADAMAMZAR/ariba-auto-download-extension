@@ -42,6 +42,18 @@
       if (message.action === 'showToast') {
         showToast(message.text, message.isError);
       }
+      if (message.action === 'hideToasts') {
+        const c = document.getElementById('ariba-toast-container');
+        if (c) c.style.visibility = 'hidden';
+      }
+      if (message.action === 'showToasts') {
+        const c = document.getElementById('ariba-toast-container');
+        if (c) c.style.visibility = '';
+      }
+      if (message.action === 'stopAutomation') {
+        window.__aribaStop = true;
+        showToast('Stopping...', false);
+      }
     });
   }
 
@@ -58,36 +70,77 @@
 
   if (allButtons.length === 0 && !supplierElement && allAnchors.length === 0) return;
 
-  // Detect Case 1 and filter elements if content-2 container exists
-  const hasCase1 = document.querySelector('.content-2, [content2]');
-  console.log('[Ariba Ext] Case 1 detected (content-2):', !!hasCase1);
+  // ── Scope detection ───────────────────────────────────────────────
+  // DOM structure when highlight present:
+  //   .highlight-container.highlight  ← big parent
+  //     ├── .content-1  (old questionnaire, ignore)
+  //     └── .content-2  (updated questionnaire, use this)
+  // DOM structure when no highlight (new user):
+  //   .highlight-container  (no highlight class)
+  //     ├── .content-1  (old, ignore)
+  //     └── .content-2  (updated, use this)
+  const highlightContainer = document.querySelector(
+    '.view-mode-content-container.highlight-container.highlight'
+  );
 
-  let expansionButtons = allButtons;
-  let fileAnchors = allAnchors;
-  if (hasCase1) {
-    expansionButtons = allButtons.filter(btn => btn.closest('.content-2, [content2]'));
-    fileAnchors = allAnchors.filter(a => a.closest('.content-2, [content2]'));
-    console.log('[Ariba Ext] Filtered elements for Case 1:', {
-      expansionButtons: expansionButtons.length,
-      fileAnchors: fileAnchors.length
-    });
+  let scopeLabel  = 'all';
+  let scopeFilter = null; // null → use all elements
+
+  if (highlightContainer) {
+    // Existing user making an amendment.
+    // content-2 is searched INSIDE the highlight container to avoid
+    // matching content-2 from other (non-highlighted) sections on the page.
+    const content2InHighlight = highlightContainer.querySelector('.content-2, [content2]');
+    if (content2InHighlight) {
+      // Amendment + two questionnaires: must be inside BOTH highlight AND content-2
+      scopeLabel  = 'highlight+content-2';
+      scopeFilter = el =>
+        el.closest('.view-mode-content-container.highlight-container.highlight') &&
+        el.closest('.content-2, [content2]');
+    } else {
+      // Amendment + one questionnaire: entire highlight container
+      scopeLabel  = 'highlight-only';
+      scopeFilter = el =>
+        el.closest('.view-mode-content-container.highlight-container.highlight');
+    }
+  } else {
+    // New user — no highlight class on any container.
+    const content2Container = document.querySelector('.content-2, [content2]');
+    if (content2Container) {
+      // Two questionnaires: only download the updated one (content-2)
+      scopeLabel  = 'content-2-only';
+      scopeFilter = el => el.closest('.content-2, [content2]');
+    }
+    // else: single questionnaire → scopeFilter stays null → all buttons
   }
+
+  console.log('[Ariba Ext] Scope mode:', scopeLabel, {
+    highlightContainer: !!highlightContainer
+  });
+
+  let expansionButtons = scopeFilter ? allButtons.filter(scopeFilter) : allButtons;
+
+  console.log('[Ariba Ext] Scoped elements:', {
+    expansionButtons: expansionButtons.length
+  });
 
   try {
     showToast('Found Ariba content. Processing...');
 
     let supplierName = 'Unknown Supplier';
     if (supplierElement) {
-      supplierName = supplierElement.textContent.trim().replace(/[\/\\?%*:|"<>]/g, '-');
+      supplierName = supplierElement.textContent.trim()
+        .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem chars
+        .replace(/\.+$/, '')              // Windows: no trailing periods
+        .trim();
     }
 
     // Step 1: Expand all sections
     if (expansionButtons.length > 0) {
       showToast(`Expanding ${expansionButtons.length} section(s)...`);
       for (const btn of expansionButtons) {
+        if (window.__aribaStop) throw new Error('Stopped by user.');
         btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        btn.style.outline = '3px solid red';
-        btn.style.backgroundColor = 'yellow';
         ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
           btn.dispatchEvent(new MouseEvent(type, { view: window, bubbles: true, cancelable: true, buttons: 1 }));
         });
@@ -101,21 +154,28 @@
     showToast('Waiting for documents to load...');
     let finalAnchors = [];
     for (let i = 0; i < 30; i++) {
+      if (window.__aribaStop) throw new Error('Stopped by user.');
       const currentAnchors = Array.from(document.querySelectorAll('.file-name-container a.file-name'));
       if (currentAnchors.length > 0) {
-        if (hasCase1) {
-          finalAnchors = currentAnchors.filter(a => a.closest('.content-2, [content2]'));
-        } else {
-          finalAnchors = currentAnchors;
-        }
-        console.log(`[Ariba Ext] Polling anchors: found ${currentAnchors.length} total, ${finalAnchors.length} in target scope.`);
+        finalAnchors = scopeFilter
+          ? currentAnchors.filter(scopeFilter)
+          : currentAnchors;
+        console.log(`[Ariba Ext] Polling anchors: found ${currentAnchors.length} total, ${finalAnchors.length} in scope (${scopeLabel}).`);
         if (finalAnchors.length > 0) break;
+      }
+      // Heartbeat toast every ~3 seconds so the user knows we are still working
+      if (i > 0 && i % 6 === 0) {
+        const remaining = Math.round(((30 - i) * 500) / 1000);
+        showToast(`Still waiting for documents... (${remaining}s left)`);
       }
       await new Promise(r => setTimeout(r, 500));
     }
 
     if (finalAnchors.length === 0) {
-      showToast('No documents found after expansion.', true);
+      showToast(
+        'No documents found. Try expanding sections manually and re-running the extension.',
+        true
+      );
       return;
     }
 
@@ -130,9 +190,12 @@
     chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, files });
     showToast('Files sent for download. Processing...');
   } catch (err) {
-    showToast('Error: ' + err.message, true);
-    console.error('[Ariba Ext] Error running automation:', err);
+    if (err.message !== 'Stopped by user.') {
+      showToast('Error: ' + err.message, true);
+      console.error('[Ariba Ext] Error running automation:', err);
+    }
   } finally {
+    window.__aribaStop = false;
     window.__aribaAutomationRunning = false;
   }
 })();
