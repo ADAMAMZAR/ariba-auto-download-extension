@@ -15,13 +15,13 @@
 //     failing with a 400 error, open DevTools → Network → filter
 //     "batchexecute" → manually perform the affected action → find the
 //     new ID. Update ONLY the constant below — no other file needs to change.
-var RPC_FETCH_SOURCES     = 'rLM1Ne'; // fetchSources()       — list all sources in a notebook
-var RPC_DELETE_SOURCE     = 'tGMBJ';  // deleteSource()       — delete a single source
-var RPC_RENAME_SOURCE     = 'b7Wfje'; // renameSource()       — rename a single source
+var RPC_FETCH_SOURCES = 'rLM1Ne'; // fetchSources()       — list all sources in a notebook
+var RPC_DELETE_SOURCE = 'tGMBJ';  // deleteSource()       — delete a single source
+var RPC_RENAME_SOURCE = 'b7Wfje'; // renameSource()       — rename a single source
 var RPC_SYNC_INSTRUCTIONS = 's0tc2d'; // updateSystemInstruction() / nlm_runner sync step
-var RPC_REGISTER_FILES    = 'o4cbdc'; // nlm_runner upload step — register file slots
-var RPC_FETCH_LABELS      = 'agX4Bc'; // fetchLabels()        — list all labels
-var RPC_UPDATE_LABEL      = 'le8sX';  // updateLabelAssignment() — add/remove label from source
+var RPC_REGISTER_FILES = 'o4cbdc'; // nlm_runner upload step — register file slots
+var RPC_FETCH_LABELS = 'agX4Bc'; // fetchLabels()        — list all labels
+var RPC_UPDATE_LABEL = 'le8sX';  // updateLabelAssignment() — add/remove label from source
 
 // ── External URLs ─────────────────────────────────────────────────────
 var NLM_API_BASE = 'https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute';
@@ -36,7 +36,7 @@ var GIST_URL = 'https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1b
 var DOWNLOAD_ROOT = 'GPO - Automatic Certificate Checker';
 
 // Extension popup window dimensions (pixels)
-var POPUP_WIDTH  = 400;
+var POPUP_WIDTH = 400;
 var POPUP_HEIGHT = 520;
 
 // Max files processed in parallel during a NotebookLM upload batch

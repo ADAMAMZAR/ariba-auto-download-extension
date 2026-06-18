@@ -102,15 +102,20 @@ async function captureFullPageScreenshot(tabId, supplierName) {
     const dataUrl = 'data:image/png;base64,' + screenshotResult.data;
     const filename = `${DOWNLOAD_ROOT}/${supplierName}/${supplierName} - screenshot.png`;
 
-    chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, () => {
-      if (chrome.runtime.lastError) {
-        notifyAribaTab(tabId, 'Screenshot save failed: ' + chrome.runtime.lastError.message, true);
-      } else {
-        notifyAribaTab(tabId, `Screenshot saved → ${filename}`);
-      }
+    // Wrap in a Promise so we can capture the downloadId for optional post-upload deletion
+    const screenshotDownloadId = await new Promise((resolve) => {
+      chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, (downloadId) => {
+        if (chrome.runtime.lastError || downloadId === undefined) {
+          notifyAribaTab(tabId, 'Screenshot save failed: ' + (chrome.runtime.lastError?.message ?? 'unknown error'), true);
+          resolve(null);
+        } else {
+          notifyAribaTab(tabId, `Screenshot saved → ${filename}`);
+          resolve(downloadId);
+        }
+      });
     });
 
-    return dataUrl;
+    return { dataUrl, screenshotDownloadId };
 
   } catch (err) {
     // Always detach on error to release the tab
@@ -118,6 +123,44 @@ async function captureFullPageScreenshot(tabId, supplierName) {
     notifyAribaTab(tabId, 'Screenshot error: ' + err.message, true);
     return null;
   }
+}
+
+// -----------------------------------------------------------------------
+// Delete a downloaded file once it reaches 'complete' state.
+// chrome.downloads.removeFile() only works after the download finishes.
+// -----------------------------------------------------------------------
+function waitForCompleteAndRemove(downloadId) {
+  if (downloadId == null) return;
+
+  // Check current state first — it may already be complete
+  chrome.downloads.search({ id: downloadId }, (results) => {
+    if (results?.[0]?.state === 'complete') {
+      chrome.downloads.removeFile(downloadId, () => {
+        if (chrome.runtime.lastError) {
+          console.warn('[Ariba Ext] removeFile failed for', downloadId, chrome.runtime.lastError.message);
+        }
+      });
+      return;
+    }
+    // Otherwise, wait for the onChanged event
+    const onChanged = (delta) => {
+      if (delta.id !== downloadId) return;
+      if (delta.state?.current === 'complete') {
+        chrome.downloads.onChanged.removeListener(onChanged);
+        chrome.downloads.removeFile(downloadId, () => {
+          if (chrome.runtime.lastError) {
+            console.warn('[Ariba Ext] removeFile failed for', downloadId, chrome.runtime.lastError.message);
+          }
+        });
+      } else if (delta.state?.current === 'interrupted') {
+        // Download failed — nothing to delete
+        chrome.downloads.onChanged.removeListener(onChanged);
+      }
+    };
+    chrome.downloads.onChanged.addListener(onChanged);
+    // Safety: stop listening after 10 minutes
+    setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 600_000);
+  });
 }
 
 // -----------------------------------------------------------------------
@@ -218,24 +261,52 @@ async function clearState(supplier) {
 }
 
 // -----------------------------------------------------------------------
+// Delete all disk downloads for a completed supplier run.
+// Called when nlm_runner.js signals that uploading is fully done.
+// -----------------------------------------------------------------------
+async function deleteSupplierDownloads(supplier) {
+  const state = await getState(supplier);
+  const ids = state.diskDownloadIds || [];
+  if (ids.length === 0) return;
+  notifyPanel(`Deleting ${ids.length} local file(s) from disk...`);
+  for (const id of ids) {
+    waitForCompleteAndRemove(id);
+  }
+  notifyPanel('Local files deleted.');
+}
+
+// -----------------------------------------------------------------------
 // Open NotebookLM once downloads are done, then interact with the checkbox
 // -----------------------------------------------------------------------
-async function maybeOpenNotebookLM(supplier) {
+// filesForNotebook is passed directly (NOT via session storage) to avoid
+// blowing the 10 MB chrome.storage.session quota with large base64 blobs.
+async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
   const state = await getState(supplier);
   if (!state.filesDone) return;
-  await clearState(supplier);
 
   if (!state.config?.connectToNotebooklm) {
+    // NLM disabled — clear state now and we're done
+    await clearState(supplier);
     notifyAribaTab(state.aribaTabId, 'Downloads complete!');
     notifyPanel('Downloads complete!', false, true);
     return;
   }
 
-  // Fetch the latest system instructions from Gist
+  // NLM enabled — keep state alive until nlm_upload_done fires so
+  // diskDownloadIds are still readable for post-upload deletion.
+  // Clear state now only when deleteAfterUpload is OFF (nothing to wait for).
+  if (!state.config?.deleteAfterUpload) {
+    await clearState(supplier);
+  }
+
+  // Note: filesForNotebook is received as a direct parameter, not from
+  // session storage, to avoid the 10 MB session quota limit.
   notifyPanel('Fetching latest system instructions...');
   let gistText = '';
   try {
-    const gistResponse = await fetch(GIST_URL);
+    // Append a timestamp to bypass GitHub's 5-minute CDN cache on raw Gist URLs.
+    // cache: 'no-store' also prevents the browser's own HTTP cache from interfering.
+    const gistResponse = await fetch(`${GIST_URL}?t=${Date.now()}`, { cache: 'no-store' });
     if (gistResponse.ok) {
       gistText = await gistResponse.text();
     } else {
@@ -248,7 +319,7 @@ async function maybeOpenNotebookLM(supplier) {
 
   notifyPanel('Opening NotebookLM...');
   const tab = await chrome.tabs.create({ url: state.config.notebooklmUrl });
-  const filesForNotebook = state.filesForNotebook || [];
+
 
   // Wait for the page to fully load, then inject the checkbox and sync script
   // Guard: prevent the script from firing more than once if 'complete' triggers multiple times
@@ -267,12 +338,19 @@ async function maybeOpenNotebookLM(supplier) {
             window.hasNotebookLMMsgBridge = true;
             window.addEventListener('message', (event) => {
               if (event.data && event.data.source === 'ariba-notebooklm-injected') {
-                chrome.runtime.sendMessage({
-                  type: 'status',
-                  text: event.data.text,
-                  error: event.data.error,
-                  done: event.data.done
-                }).catch(() => { });
+                // Relay action messages (e.g. nlm_upload_done) directly to the background
+                if (event.data.action) {
+                  chrome.runtime.sendMessage({
+                    action: event.data.action
+                  }).catch(() => { });
+                } else {
+                  chrome.runtime.sendMessage({
+                    type: 'status',
+                    text: event.data.text,
+                    error: event.data.error,
+                    done: event.data.done
+                  }).catch(() => { });
+                }
               }
             });
           }
@@ -370,6 +448,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return;
     }
 
+    // ── Triggered by nlm_runner.js after all files are uploaded and processed ──
+    if (request.action === 'nlm_upload_done') {
+      try {
+        // Find the session entry with diskDownloadIds and deleteAfterUpload flag
+        const allData = await chrome.storage.session.get(null);
+        for (const [key, val] of Object.entries(allData)) {
+          if (!key.startsWith('pending_')) continue;
+          const supplier = val.supplierKey || key.replace('pending_', '');
+          if (val.config?.deleteAfterUpload) {
+            await deleteSupplierDownloads(supplier);
+          }
+          // Always clear state now that NLM is done
+          await clearState(supplier);
+        }
+      } catch (e) {
+        console.warn('[Ariba Ext] nlm_upload_done handler error:', e?.message ?? e);
+      }
+      return;
+    }
+
     if (request.action === 'downloadFiles') {
       const AUTOMATION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
       let timeoutHandle;
@@ -406,14 +504,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           // ── Disk downloads (always) ──────────────────────────────────────
           const files = request.files || [];
-          for (const file of files) {
+          // Collect downloadIds so we can optionally delete the files after upload
+          const diskDownloadIds = [];
+          await Promise.all(files.map(file => new Promise((resolve) => {
             const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(file.filename)}`;
             chrome.downloads.download({ url: file.url, filename: destFilename, saveAs: false },
               (downloadId) => {
                 if (chrome.runtime.lastError || downloadId === undefined) {
                   notifyAribaTab(tabId, `Download failed to start: ${file.filename}`, true);
+                  resolve();
                   return;
                 }
+                diskDownloadIds.push(downloadId);
                 // Watch for interruption / failure
                 const onChanged = (delta) => {
                   if (delta.id !== downloadId) return;
@@ -429,9 +531,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 chrome.downloads.onChanged.addListener(onChanged);
                 // Safety: remove listener after 5 minutes
                 setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 300_000);
+                resolve();
               }
             );
-          }
+          })));
 
           // ── In-memory fetch for NotebookLM (only when NLM is enabled) ───
           const filesForNotebook = [];
@@ -472,9 +575,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           // Hide toasts so they don't appear in the screenshot
           if (tabId) chrome.tabs.sendMessage(tabId, { action: 'hideToasts' }).catch(() => {});
 
-          let screenshotDataUrl = null;
+          let screenshotResult = null;
           if (tabId) {
-            screenshotDataUrl = await captureFullPageScreenshot(tabId, s);
+            screenshotResult = await captureFullPageScreenshot(tabId, s);
           } else {
             notifyAribaTab(tabId, 'Could not determine Ariba tab for screenshot.', true);
           }
@@ -482,21 +585,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           // Restore toasts
           if (tabId) chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
 
-          if (screenshotDataUrl && nlmEnabled) {
+          // screenshotResult is { dataUrl, screenshotDownloadId } or null
+          if (screenshotResult?.dataUrl && nlmEnabled) {
             filesForNotebook.push({
               filename: `${s} - screenshot.png`,
-              dataUrl: screenshotDataUrl,
+              dataUrl: screenshotResult.dataUrl,
               mimeType: 'image/png'
             });
+          }
+          // Track the screenshot's disk file ID for optional deletion
+          if (screenshotResult?.screenshotDownloadId != null) {
+            diskDownloadIds.push(screenshotResult.screenshotDownloadId);
           }
 
           const state = await getState(s);
           state.config = notebooklmConfig || null;
           state.filesDone = true;
-          state.filesForNotebook = filesForNotebook;
+          // filesForNotebook is NOT stored in session to avoid quota overflow.
+          // It is passed directly to maybeOpenNotebookLM as a parameter.
           state.aribaTabId = tabId;
+          state.diskDownloadIds = diskDownloadIds;
+          state.supplierKey = s;
           await setState(s, state);
-          await maybeOpenNotebookLM(s);
+          await maybeOpenNotebookLM(s, filesForNotebook);
 
         })()]); // end Promise.race
       } catch (err) {

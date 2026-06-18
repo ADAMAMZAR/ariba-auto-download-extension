@@ -71,52 +71,47 @@
   if (allButtons.length === 0 && !supplierElement && allAnchors.length === 0) return;
 
   // ── Scope detection ───────────────────────────────────────────────
-  // DOM structure when highlight present:
-  //   .highlight-container.highlight  ← big parent
-  //     ├── .content-1  (old questionnaire, ignore)
-  //     └── .content-2  (updated questionnaire, use this)
-  // DOM structure when no highlight (new user):
-  //   .highlight-container  (no highlight class)
-  //     ├── .content-1  (old, ignore)
-  //     └── .content-2  (updated, use this)
-  const highlightContainer = document.querySelector(
-    '.view-mode-content-container.highlight-container.highlight'
-  );
+  // If the page has .content-2, only target that (updated questionnaire).
+  // Otherwise fall back to downloading everything.
+  //
+  // ── HIGHLIGHT DETECTION (commented out — preserved for future use) ────
+  // Previously the extension also detected amendment scenarios via the
+  // .highlight-container.highlight class, which triggered two extra modes:
+  //   • 'highlight+content-2' — inside BOTH highlight AND content-2
+  //   • 'highlight-only'      — inside highlight container only
+  // To re-enable, uncomment the block below and remove the simplified logic.
+  //
+  // const highlightContainer = document.querySelector(
+  //   '.view-mode-content-container.highlight-container.highlight'
+  // );
+  // if (highlightContainer) {
+  //   const content2InHighlight = highlightContainer.querySelector('.content-2, [content2]');
+  //   if (content2InHighlight) {
+  //     scopeLabel  = 'highlight+content-2';
+  //     scopeFilter = el =>
+  //       el.closest('.view-mode-content-container.highlight-container.highlight') &&
+  //       el.closest('.content-2, [content2]');
+  //   } else {
+  //     scopeLabel  = 'highlight-only';
+  //     scopeFilter = el =>
+  //       el.closest('.view-mode-content-container.highlight-container.highlight');
+  //   }
+  // } else { ... see content-2 / all logic below ... }
+  // ─────────────────────────────────────────────────────────────────────
 
-  let scopeLabel  = 'all';
+  let scopeLabel = 'all';
   let scopeFilter = null; // null → use all elements
 
-  if (highlightContainer) {
-    // Existing user making an amendment.
-    // content-2 is searched INSIDE the highlight container to avoid
-    // matching content-2 from other (non-highlighted) sections on the page.
-    const content2InHighlight = highlightContainer.querySelector('.content-2, [content2]');
-    if (content2InHighlight) {
-      // Amendment + two questionnaires: must be inside BOTH highlight AND content-2
-      scopeLabel  = 'highlight+content-2';
-      scopeFilter = el =>
-        el.closest('.view-mode-content-container.highlight-container.highlight') &&
-        el.closest('.content-2, [content2]');
-    } else {
-      // Amendment + one questionnaire: entire highlight container
-      scopeLabel  = 'highlight-only';
-      scopeFilter = el =>
-        el.closest('.view-mode-content-container.highlight-container.highlight');
-    }
-  } else {
-    // New user — no highlight class on any container.
-    const content2Container = document.querySelector('.content-2, [content2]');
-    if (content2Container) {
-      // Two questionnaires: only download the updated one (content-2)
-      scopeLabel  = 'content-2-only';
-      scopeFilter = el => el.closest('.content-2, [content2]');
-    }
-    // else: single questionnaire → scopeFilter stays null → all buttons
+  const content2Container = document.querySelector('.content-2, [content2]');
+  if (content2Container) {
+    // Two questionnaires present: only download from the updated one (content-2)
+    scopeLabel = 'content-2-only';
+    scopeFilter = el => el.closest('.content-2, [content2]');
   }
+  // else: single questionnaire → scopeFilter stays null → all buttons
 
-  console.log('[Ariba Ext] Scope mode:', scopeLabel, {
-    highlightContainer: !!highlightContainer
-  });
+  console.log('[Ariba Ext] Scope mode:', scopeLabel);
+
 
   let expansionButtons = scopeFilter ? allButtons.filter(scopeFilter) : allButtons;
 

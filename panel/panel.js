@@ -2,6 +2,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const downloadBtn = document.getElementById('download-btn');
   const stopBtn     = document.getElementById('stop-btn');
   const connectCheckbox = document.getElementById('connect-notebooklm');
+  const deleteAfterUploadCheckbox = document.getElementById('delete-after-upload');
   const notebooklmContainer = document.getElementById('notebooklm-container');
   const notebooklmUrlInput = document.getElementById('notebooklm-url');
   const logEntries = document.getElementById('log-entries');
@@ -25,10 +26,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // ── Restore user prefs from local storage (persists across browser restarts) ──
   // Both the URL field and the checkbox state are user preferences → chrome.storage.local.
   // Only ephemeral per-run state (notebooklmConfig) lives in chrome.storage.session.
-  chrome.storage.local.get(['notebooklmUrl', 'connectToNotebooklm'], r => {
+  chrome.storage.local.get(['notebooklmUrl', 'connectToNotebooklm', 'deleteAfterUpload'], r => {
     if (r.notebooklmUrl) notebooklmUrlInput.value = r.notebooklmUrl;
     if (typeof r.connectToNotebooklm === 'boolean') {
       connectCheckbox.checked = r.connectToNotebooklm;
+    }
+    if (typeof r.deleteAfterUpload === 'boolean') {
+      deleteAfterUploadCheckbox.checked = r.deleteAfterUpload;
     }
     notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
   });
@@ -40,6 +44,10 @@ document.addEventListener('DOMContentLoaded', () => {
   connectCheckbox.addEventListener('change', () => {
     notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
     chrome.storage.local.set({ connectToNotebooklm: connectCheckbox.checked });
+  });
+
+  deleteAfterUploadCheckbox.addEventListener('change', () => {
+    chrome.storage.local.set({ deleteAfterUpload: deleteAfterUploadCheckbox.checked });
   });
 
   downloadBtn.addEventListener('click', async () => {
@@ -69,7 +77,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       // Store ephemeral per-run config in session storage (cleared on browser restart)
       await chrome.storage.session.set({
-        notebooklmConfig: { connectToNotebooklm, notebooklmUrl }
+        notebooklmConfig: { connectToNotebooklm, notebooklmUrl, deleteAfterUpload: deleteAfterUploadCheckbox.checked }
       });
 
       // Inject toast CSS before the script so classes are available on first call

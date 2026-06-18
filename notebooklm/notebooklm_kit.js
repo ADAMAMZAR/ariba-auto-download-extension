@@ -1030,11 +1030,8 @@ async function syncInstructions() {
   const statusMsg = document.getElementById('sync-status');
 
   try {
-    // Note: The specific commit hash was intentionally removed from this URL
-    // so that it always fetches the absolute latest version saved to the Gist!
-    const url = 'https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1bedfe76caf59f3/raw/gistfile1.txt';
-
-    const response = await fetch(url);
+    const url = `${GIST_URL}?t=${Date.now()}`;
+    const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) throw new Error('Failed to fetch from URL');
     const text = await response.text();
 

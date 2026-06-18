@@ -30,6 +30,14 @@
     }, '*');
   };
 
+  /** Send a background action via the isolated-world message bridge. */
+  const sendAction = (action) => {
+    window.postMessage({
+      source: 'ariba-notebooklm-injected',
+      action
+    }, '*');
+  };
+
   const wait = ms => new Promise(r => setTimeout(r, ms));
   const generateReqId = () => Math.floor(Math.random() * 90000) + 10000;
 
@@ -345,6 +353,10 @@
 
           // Small buffer for the UI to settle before next step
           await wait(2000);
+
+          // Notify background that upload + processing is complete
+          // (background will delete local files if deleteAfterUpload is enabled)
+          sendAction('nlm_upload_done');
         }
       } catch (err) {
         sendStatus('API upload failed: ' + err.message, true);
