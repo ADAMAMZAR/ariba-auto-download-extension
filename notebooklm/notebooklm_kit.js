@@ -12,6 +12,132 @@ let authToken = '';
 let sourceCountCache = {}; // { notebookId: boolean } — true if notebook has at least 1 source
 let sourceCheckTimer = null;
 
+// Tracks whether a mandatory sync is pending (gist changed since last sync)
+let syncPending = false;
+
+// Simple 32-bit hash to detect gist content changes between page loads
+function simpleHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+  }
+  return h.toString(36);
+}
+
+// Read the notebook title from the page heading.
+// The actual NotebookLM DOM uses: span.title-label-inner (inside div.title > div.title-label)
+function getNotebookTitle() {
+  // Primary: exact selector from the live NotebookLM DOM
+  const primary = document.querySelector('span.title-label-inner');
+  if (primary && primary.innerText && primary.innerText.trim()) {
+    return primary.innerText.trim();
+  }
+
+  // Fallback chain for any future DOM changes
+  const fallbacks = [
+    document.querySelector('.title-input'),          // the sibling <input> holds same value
+    document.querySelector('[class*="title-label"]'), // any element with title-label in class
+    document.querySelector('h1'),
+  ];
+  for (const el of fallbacks) {
+    const text = el && (el.value || el.innerText || '').trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+// Returns true when the notebook title starts with "CQ Checker - "
+function isCQCheckerNotebook() {
+  return getNotebookTitle().startsWith('CQ Checker - ');
+}
+
+// Check gist for changes and update sync button state accordingly.
+// Called once on page load (in notebooklm_kit only — NOT in nlm_runner).
+async function checkGistForChanges() {
+  const title = getNotebookTitle();
+  const isCQ = isCQCheckerNotebook();
+  console.log('[NLM Kit] checkGistForChanges — title:', title, '| isCQ:', isCQ);
+
+  if (!isCQ) {
+    console.log('[NLM Kit] Not a CQ Checker notebook, skipping gist check.');
+    return;
+  }
+
+  try {
+    const url = `${GIST_URL}?t=${Date.now()}`;
+    console.log('[NLM Kit] Fetching gist from:', url);
+
+    const response = await fetch(url, { cache: 'no-store' });
+
+    if (!response.ok) {
+      console.warn('[NLM Kit] Gist fetch failed:', response.status, response.statusText);
+      return;
+    }
+
+    const text = await response.text();
+    const hash = simpleHash(text);
+    console.log('[NLM Kit] Gist fetched OK. Hash:', hash);
+
+    // Use localStorage so the baseline survives new tabs and browser restarts
+    const storageKey = `nlm_synced_gist_hash_${getNotebookId()}`;
+    const lastHash = localStorage.getItem(storageKey);
+    console.log('[NLM Kit] Stored hash:', lastHash);
+
+    if (lastHash === null) {
+      // Very first time — store the current hash as the baseline and don't block
+      localStorage.setItem(storageKey, hash);
+      console.log('[NLM Kit] First run — baseline hash stored:', hash);
+    } else if (lastHash !== hash) {
+      // Gist has changed since the user last synced — require sync first
+      console.log('[NLM Kit] ⚠️ Gist changed! Old:', lastHash, '→ New:', hash, '| Setting syncPending = true');
+      syncPending = true;
+      updateSyncButtonState();
+    } else {
+      console.log('[NLM Kit] Gist unchanged. No action needed.');
+    }
+  } catch (e) {
+    console.error('[NLM Kit] Error in checkGistForChanges:', e);
+    // Network failure — don't block the user
+  }
+}
+
+// Update the sync button's visual state (badge + tooltip) and
+// enable/disable the other action buttons based on syncPending.
+function updateSyncButtonState() {
+  const syncBtn = document.getElementById('bulk-sync-btn');
+  const badge = document.getElementById('nlm-sync-badge');
+
+  if (!syncBtn) return;
+
+  if (syncPending) {
+    // Show pulsing red badge on the sync button
+    if (!badge) {
+      const dot = document.createElement('span');
+      dot.id = 'nlm-sync-badge';
+      dot.className = 'nlm-sync-badge';
+      syncBtn.style.position = 'relative';
+      syncBtn.appendChild(dot);
+    }
+    syncBtn.title = '⚠️ Instructions updated — click to sync before running';
+
+    // Disable the other three action buttons until sync is done
+    ['bulk-rename-btn', 'bulk-label-btn', 'bulk-delete-btn'].forEach(id => {
+      const btn = document.getElementById(id);
+      if (btn) {
+        btn.disabled = true;
+        btn.title = 'Please sync instructions first';
+      }
+    });
+  } else {
+    // Remove badge if present
+    if (badge) badge.remove();
+    syncBtn.title = 'Sync System Instructions';
+    // Re-enable source buttons (let scheduleSourceCheck decide the final state)
+    const notebookId = getNotebookId();
+    if (notebookId) scheduleSourceCheck(notebookId);
+  }
+}
+
 // Inject script to get tokens from the main page context
 function injectTokenScript() {
   const script = document.createElement('script');
@@ -612,7 +738,10 @@ function injectButton() {
   // If the container exists, ensure it's still right next to our target node
   if (existingContainer) {
     if (existingContainer.previousElementSibling === targetNode) {
-      return; // It's correctly positioned
+      // Container is in the right place — just refresh the sync button visibility
+      const syncBtn = document.getElementById('bulk-sync-btn');
+      if (syncBtn) syncBtn.style.display = isCQCheckerNotebook() ? '' : 'none';
+      return;
     } else {
       existingContainer.remove(); // Re-inject it in the correct spot
     }
@@ -653,12 +782,13 @@ function injectButton() {
     </svg>
   `;
 
-  // Sync toggle button
+  // Sync toggle button — only shown for "CQ Checker - ..." notebooks
   const syncBtn = document.createElement('button');
   syncBtn.id = 'bulk-sync-btn';
   syncBtn.title = 'Sync System Instructions';
   syncBtn.onclick = syncInstructions;
   syncBtn.className = 'nlm-action-btn';
+  syncBtn.style.display = isCQCheckerNotebook() ? '' : 'none';
   syncBtn.innerHTML = `
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M21 2v6h-6"></path>
@@ -702,17 +832,100 @@ function injectButton() {
   // Kick off background source check to enable buttons if sources are present
   const nbId = getNotebookId();
   if (nbId) scheduleSourceCheck(nbId);
+
+  // Apply any pending sync state to the newly injected buttons
+  if (syncPending) updateSyncButtonState();
+}
+
+// Show a non-intrusive toast telling the user they must sync first.
+function showSyncRequiredToast() {
+  const existing = document.getElementById('nlm-sync-toast');
+  if (existing) {
+    // Re-trigger animation
+    existing.classList.remove('nlm-toast-visible');
+    void existing.offsetWidth; // force reflow
+    existing.classList.add('nlm-toast-visible');
+    clearTimeout(existing._hideTimer);
+    existing._hideTimer = setTimeout(() => existing.remove(), 3500);
+    return;
+  }
+  const toast = document.createElement('div');
+  toast.id = 'nlm-sync-toast';
+  toast.className = 'nlm-sync-toast';
+  toast.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex-shrink:0">
+      <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+      <line x1="12" y1="9" x2="12" y2="13"></line>
+      <line x1="12" y1="17" x2="12.01" y2="17"></line>
+    </svg>
+    Instructions updated — please <strong>sync</strong> before running.
+  `;
+  document.body.appendChild(toast);
+  // Trigger animation on next frame
+  requestAnimationFrame(() => toast.classList.add('nlm-toast-visible'));
+  toast._hideTimer = setTimeout(() => toast.remove(), 3500);
 }
 
 // Initialize
 injectTokenScript();
 injectButton();
 
+// Check gist for changes once the auth token is ready (max 3s wait)
+// This is only performed in the notebooklm_kit content script context.
+(async () => {
+  // 1. Wait for the auth token (injected async), up to 5s
+  for (let i = 0; i < 50 && !authToken; i++) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  // 2. Wait for the notebook title element to be rendered by Angular, up to 5s
+  //    Without this, isCQCheckerNotebook() races and always returns false.
+  for (let i = 0; i < 50; i++) {
+    const titleEl = document.querySelector('span.title-label-inner');
+    if (titleEl && titleEl.innerText && titleEl.innerText.trim()) break;
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  await checkGistForChanges();
+})();
+
 // Use MutationObserver to ensure the button stays on the page even if React re-renders
 const observer = new MutationObserver(() => {
   injectButton();
 });
 observer.observe(document.body, { childList: true, subtree: true });
+
+// Intercept submit button clicks and Enter-key presses when a sync is required.
+// Uses the CAPTURING phase (true) so we fire before NotebookLM's own handlers.
+document.addEventListener('click', (e) => {
+  if (!syncPending) return;
+  const btn = e.target.closest('button.submit-button, button[aria-label="Submit"], button[type="submit"]');
+  if (btn) {
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    showSyncRequiredToast();
+  }
+}, true);
+
+document.addEventListener('keydown', (e) => {
+  if (!syncPending) return;
+  if (e.key === 'Enter' && !e.shiftKey) {
+    const textarea = e.target.closest('textarea.query-box-input, textarea[aria-label="Query box"], textarea');
+    if (textarea) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      showSyncRequiredToast();
+    }
+  }
+}, true);
+
+// Also intercept the form's own submit event as a final safety net
+document.addEventListener('submit', (e) => {
+  if (!syncPending) return;
+  e.stopImmediatePropagation();
+  e.preventDefault();
+  showSyncRequiredToast();
+}, true);
 
 
 // --- RENAME UI LOGIC ---
@@ -1037,6 +1250,15 @@ async function syncInstructions() {
 
     statusMsg.innerText = 'Updating Notebook...';
     await updateSystemInstruction(notebookId, text);
+
+    // Store the new hash so we know the user is up to date
+    const hash = simpleHash(text);
+    localStorage.setItem(`nlm_synced_gist_hash_${notebookId}`, hash);
+    console.log('[NLM Kit] Sync complete. New hash stored in localStorage:', hash);
+
+    // Clear the mandatory-sync gate and re-enable other buttons
+    syncPending = false;
+    updateSyncButtonState();
 
     statusMsg.innerText = 'Success! Instructions updated.';
     statusMsg.style.color = '#0f9d58';
