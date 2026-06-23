@@ -178,8 +178,9 @@ function notifyPanel(text, error = false, done = false) {
 
 function cleanName(n) {
   return n
-    .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem characters
-    .replace(/\.+$/, '')              // Windows: names cannot end with a period
+    .replace(/["']/g, '')              // Strip quotes completely instead of making them dashes
+    .replace(/[\/\\?%*:|<>]/g, '-')    // Replace illegal filesystem characters with dashes
+    .replace(/\.+$/, '')               // Windows: names cannot end with a period
     .trim();                           // no leading/trailing spaces
 }
 
@@ -502,69 +503,116 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
           const nlmEnabled = notebooklmConfig?.connectToNotebooklm === true;
 
-          // ── Disk downloads (always) ──────────────────────────────────────
+          // ── Process files sequentially: Fetch → Extract Name → Disk + NLM ──
           const files = request.files || [];
-          // Collect downloadIds so we can optionally delete the files after upload
           const diskDownloadIds = [];
-          await Promise.all(files.map(file => new Promise((resolve) => {
-            const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(file.filename)}`;
-            chrome.downloads.download({ url: file.url, filename: destFilename, saveAs: false },
-              (downloadId) => {
+          const filesForNotebook = [];
+          const usedFilenames = new Set(); // Track filenames to guarantee uniqueness
+
+          for (let idx = 0; idx < files.length; idx++) {
+            if (stopSignal.aborted) throw new Error('Stopped by user.');
+            const file = files[idx];
+            let realFilename = file.filename.replace(/["']/g, '').trim();
+            let mimeType = '';
+            let dataUrl = null;
+
+            notifyAribaTab(tabId, `Fetching file ${idx + 1}/${files.length}: ${realFilename}...`);
+
+            try {
+              // We fetch the file to memory. This is required for NotebookLM, but also gives us
+              // the true Content-Disposition and Content-Type to fix missing extensions.
+              const resp = await fetchWithRetry(file.url, {
+                retries: 2, timeoutMs: 30000, delayMs: 2000, tabId, filename: realFilename, stopSignal
+              });
+
+              // 1. Try to get the real filename from Content-Disposition
+              const disp = resp.headers.get('Content-Disposition');
+              if (disp) {
+                // Try to match filename*=UTF-8''...
+                const utf8Match = disp.match(/filename\*=UTF-8''([^;\n]*)/i);
+                if (utf8Match && utf8Match[1]) {
+                  try { realFilename = decodeURIComponent(utf8Match[1]); } catch (e) { realFilename = utf8Match[1]; }
+                } else {
+                  // Fallback to standard filename="..."
+                  const match = disp.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
+                  if (match && match[1]) {
+                    let extracted = match[1].replace(/['"]/g, '').trim();
+                    // Some servers illegally URL-encode the standard filename attribute
+                    if (extracted.includes('%')) {
+                      try { extracted = decodeURIComponent(extracted); } catch (e) {}
+                    }
+                    if (extracted) realFilename = extracted;
+                  }
+                }
+              }
+
+              const blob = await resp.blob();
+              mimeType = blob.type || resp.headers.get('Content-Type') || '';
+
+              // 2. Fallback: if filename STILL doesn't have an extension, guess from the mime type
+              if (!realFilename.includes('.')) {
+                if (mimeType.includes('pdf')) realFilename += '.pdf';
+                else if (mimeType.includes('png')) realFilename += '.png';
+                else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) realFilename += '.jpg';
+                else if (mimeType.includes('word') || mimeType.includes('document')) realFilename += '.docx';
+                else if (mimeType.includes('excel') || mimeType.includes('sheet')) realFilename += '.xlsx';
+                else if (mimeType.includes('text/plain')) realFilename += '.txt';
+                else realFilename += '.pdf'; // safest fallback for Ariba documents
+              }
+
+              // 3. Deduplicate filenames: if Ariba provides multiple files with the EXACT same name,
+              // Chrome downloads will silently append ' (1)' to the disk file, but NotebookLM would 
+              // receive duplicate names and fail. We explicitly append ' (1)' to both here.
+              let uniqueFilename = realFilename;
+              let counter = 1;
+              while (usedFilenames.has(uniqueFilename.toLowerCase())) {
+                const lastDot = realFilename.lastIndexOf('.');
+                if (lastDot !== -1) {
+                  uniqueFilename = `${realFilename.substring(0, lastDot)} (${counter})${realFilename.substring(lastDot)}`;
+                } else {
+                  uniqueFilename = `${realFilename} (${counter})`;
+                }
+                counter++;
+              }
+              usedFilenames.add(uniqueFilename.toLowerCase());
+              realFilename = uniqueFilename;
+
+              if (nlmEnabled) {
+                dataUrl = await blobToDataUrl(blob);
+                filesForNotebook.push({
+                  filename: `${s} - ${cleanName(realFilename)}`,
+                  dataUrl,
+                  mimeType
+                });
+              }
+
+            } catch (err) {
+              if (err.message === 'Stopped by user.') throw err;
+              notifyAribaTab(tabId, `Failed to fetch "${realFilename}" after retries: ${err.message}`, true);
+              continue; // Skip this file and move to the next
+            }
+
+            // ── Save to disk using the CORRECTED filename ──
+            await new Promise((resolve) => {
+              const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(realFilename)}`;
+              chrome.downloads.download({ url: file.url, filename: destFilename, saveAs: false }, (downloadId) => {
                 if (chrome.runtime.lastError || downloadId === undefined) {
-                  notifyAribaTab(tabId, `Download failed to start: ${file.filename}`, true);
+                  notifyAribaTab(tabId, `Disk download failed: ${realFilename}`, true);
                   resolve();
                   return;
                 }
                 diskDownloadIds.push(downloadId);
-                // Watch for interruption / failure
                 const onChanged = (delta) => {
                   if (delta.id !== downloadId) return;
-                  if (delta.state?.current === 'interrupted') {
-                    notifyAribaTab(tabId,
-                      `Download interrupted: ${file.filename}` +
-                      (delta.error?.current ? ` (${delta.error.current})` : ''), true);
-                    chrome.downloads.onChanged.removeListener(onChanged);
-                  } else if (delta.state?.current === 'complete') {
+                  if (delta.state?.current === 'interrupted' || delta.state?.current === 'complete') {
                     chrome.downloads.onChanged.removeListener(onChanged);
                   }
                 };
                 chrome.downloads.onChanged.addListener(onChanged);
-                // Safety: remove listener after 5 minutes
                 setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 300_000);
                 resolve();
-              }
-            );
-          })));
-
-          // ── In-memory fetch for NotebookLM (only when NLM is enabled) ───
-          const filesForNotebook = [];
-          if (nlmEnabled) {
-            for (let idx = 0; idx < files.length; idx++) {
-              if (stopSignal.aborted) throw new Error('Stopped by user.');
-              const file = files[idx];
-              notifyAribaTab(tabId, `Fetching file ${idx + 1}/${files.length}: ${file.filename}...`);
-              try {
-                const resp = await fetchWithRetry(file.url, {
-                  retries: 2,
-                  timeoutMs: 30_000,
-                  delayMs: 2000,
-                  tabId,
-                  filename: file.filename,
-                  stopSignal
-                });
-                const blob = await resp.blob();
-                const dataUrl = await blobToDataUrl(blob);
-                filesForNotebook.push({
-                  filename: `${s} - ${cleanName(file.filename)}`,
-                  dataUrl,
-                  mimeType: blob.type
-                });
-              } catch (err) {
-                if (err.message === 'Stopped by user.') throw err; // propagate stop
-                notifyAribaTab(tabId,
-                  `Failed to fetch "${file.filename}" after retries: ${err.message}`, true);
-              }
-            }
+              });
+            });
           }
 
           if (stopSignal.aborted) throw new Error('Stopped by user.');

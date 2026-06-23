@@ -13,7 +13,10 @@ window.fetch = async function(...args) {
   const response = await _originalFetch.apply(this, args);
   try {
     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url ?? '';
-    if (url.includes('rLM1Ne') && !url.includes('nlm_kit=true')) {
+    // Skip data:/blob: URLs — they can be 10+ MB base64 strings and are never RPC calls.
+    // Running .includes() on them is wasteful and could trigger false positives.
+    if (!url.startsWith('data:') && !url.startsWith('blob:') &&
+        url.includes('rLM1Ne') && !url.includes('nlm_kit=true')) {
       console.log('[NLM Kit Inject] Intercepted Fetch rLM1Ne request');
       window.postMessage({ type: 'NOTEBOOKLM_SOURCES_UPDATED' }, '*');
     }

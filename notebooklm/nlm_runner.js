@@ -270,7 +270,24 @@
               try {
                 // Fetch the data URL as a Blob for upload
                 const res = await fetch(file.dataUrl);
-                const blob = await res.blob();
+                const rawBlob = await res.blob();
+
+                // Fallback for missing MIME types (Ariba servers sometimes omit Content-Type)
+                // If we upload with an empty type, NLM accepts it but hangs infinitely on "processing..."
+                let mimeType = file.mimeType || rawBlob.type;
+                if (!mimeType) {
+                  const ext = file.filename.split('.').pop().toLowerCase();
+                  if (ext === 'pdf') mimeType = 'application/pdf';
+                  else if (ext === 'png') mimeType = 'image/png';
+                  else if (ext === 'jpg' || ext === 'jpeg') mimeType = 'image/jpeg';
+                  else if (ext === 'txt') mimeType = 'text/plain';
+                  else mimeType = 'application/octet-stream';
+                }
+
+                // CRITICAL: Reconstruct the blob with the explicit MIME type.
+                // If we just pass `rawBlob` (which might have an empty .type) to fetch(), 
+                // the browser can overwrite our custom Content-Type header with an empty string.
+                const typedBlob = new Blob([rawBlob], { type: mimeType });
 
                 // Start a Scotty resumable upload session
                 const initUrl = `${NLM_UPLOAD_BASE}?authuser=0&source_id=${encodeURIComponent(sourceId)}`;
@@ -279,8 +296,8 @@
                   headers: {
                     'X-Goog-Upload-Protocol': 'resumable',
                     'X-Goog-Upload-Command': 'start',
-                    'X-Goog-Upload-Header-Content-Length': blob.size.toString(),
-                    'X-Goog-Upload-Header-Content-Type': file.mimeType,
+                    'X-Goog-Upload-Header-Content-Length': typedBlob.size.toString(),
+                    'X-Goog-Upload-Header-Content-Type': mimeType,
                     'Content-Type': 'application/json'
                   },
                   body: JSON.stringify({ PROJECT_ID: notebookId, SOURCE_NAME: file.filename, SOURCE_ID: sourceId })
@@ -302,10 +319,10 @@
                   headers: {
                     'X-Goog-Upload-Command': 'upload, finalize',
                     'X-Goog-Upload-Offset': '0',
-                    'Content-Type': file.mimeType,
-                    'Content-Length': blob.size.toString()
+                    'Content-Type': mimeType,
+                    'Content-Length': typedBlob.size.toString()
                   },
-                  body: blob
+                  body: typedBlob
                 });
 
                 if (uploadRes.ok) {
@@ -322,19 +339,29 @@
 
           sendStatus('All files uploaded successfully.');
 
-          // Poll until NotebookLM finishes processing (spinners / "processing..." text gone)
+          // Poll until NotebookLM finishes processing uploaded sources.
+          // MAINTENANCE: If this exits too early or waits too long, adjust the selectors below.
+          // We deliberately exclude [role="progressbar"] and mat-progress-bar — Angular Material
+          // uses those roles for many persistent UI chrome, not just source-processing spinners.
           sendStatus('Waiting for NotebookLM to finish processing all documents...');
-          const maxWaitMs = 120000; // 2 minutes max
+          const maxWaitMs = 120000; // 2 minutes hard cap
           const intervalMs = 1000;
           let elapsedMs = 0;
+
+          // Stall detection: if the loader count hasn't changed for this long, some sources
+          // are permanently stuck (e.g. a failed upload left an empty source slot).
+          // Break out rather than burning the full 2 minutes.
+          const staleAfterMs = 30000; // 30 seconds without progress → give up
+          let lastLoaderCount = -1;
+          let sameCountStreakMs = 0;
 
           const isVisible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 
           while (elapsedMs < maxWaitMs) {
-            const potentialLoaders = Array.from(document.querySelectorAll(
-              'mat-progress-spinner, mat-spinner, mat-progress-bar, .loading, .spinner, [role="progressbar"]'
-            ));
-            const visibleLoaders = potentialLoaders.filter(isVisible);
+            // Only target spinners that specifically appear next to source items while processing
+            const visibleLoaders = Array.from(document.querySelectorAll(
+              'mat-progress-spinner, mat-spinner, .loading, .spinner'
+            )).filter(isVisible);
 
             const visibleLoadingText = Array.from(document.querySelectorAll('*')).filter(el => {
               if (el.children.length > 0 || !isVisible(el)) return false;
@@ -342,9 +369,24 @@
               return text.includes('uploading...') || text.includes('processing...');
             });
 
-            if (visibleLoaders.length === 0 && visibleLoadingText.length === 0) {
+            const totalLoaders = visibleLoaders.length + visibleLoadingText.length;
+
+            if (totalLoaders === 0) {
               sendStatus('NotebookLM finished processing all documents.');
               break;
+            }
+
+            // Stall detection: count unchanged → some sources are stuck, don't wait forever
+            if (totalLoaders === lastLoaderCount) {
+              sameCountStreakMs += intervalMs;
+              if (sameCountStreakMs >= staleAfterMs) {
+                sendStatus(`${totalLoaders} source(s) still loading — may be stuck. Proceeding anyway.`);
+                break;
+              }
+            } else {
+              // Progress detected — reset stall counter
+              sameCountStreakMs = 0;
+              lastLoaderCount = totalLoaders;
             }
 
             await wait(intervalMs);
