@@ -161,6 +161,11 @@ window.addEventListener('message', (event) => {
       scheduleSourceCheck(nbId);
     }
   }
+
+  if (event.data.type === 'NOTEBOOKLM_SYNC_COMPLETE') {
+    syncPending = false;
+    updateSyncButtonState();
+  }
 });
 
 // Function to get notebook ID from URL

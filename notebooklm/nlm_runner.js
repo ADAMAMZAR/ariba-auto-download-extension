@@ -108,6 +108,16 @@
           if (response.ok) {
             sendStatus('System instructions synced successfully.');
             sessionStorage.setItem(syncKey, 'true');
+            
+            const simpleHash = (str) => {
+              let h = 0;
+              for (let i = 0; i < str.length; i++) {
+                h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+              }
+              return h.toString(36);
+            };
+            localStorage.setItem(`nlm_synced_gist_hash_${notebookId}`, simpleHash(instructionText));
+            window.postMessage({ type: 'NOTEBOOKLM_SYNC_COMPLETE' }, '*');
           } else {
             sendStatus('Failed to sync system instructions: ' + response.statusText, true);
           }
@@ -121,10 +131,10 @@
   }
 
   // ── Step 1: Toggle "Select All" checkbox BEFORE uploading ─────────────
-  let nativeInput = null;
+  let selectAllInput = null;
   for (let i = 0; i < 40; i++) { // up to 10 seconds
-    nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
-    if (nativeInput) break;
+    selectAllInput = document.querySelector('input[type="checkbox"][aria-label*="elect all"]');
+    if (selectAllInput) break;
 
     // If the query box or upload modal close button is already visible the page
     // has finished loading — no point waiting further for the checkbox.
@@ -132,28 +142,44 @@
     const closeBtn = document.querySelector('button[aria-label="Close"].close-button');
     if (queryBox || closeBtn) {
       await wait(500); // small buffer for Angular to finish rendering
-      nativeInput = document.querySelector('#mat-mdc-checkbox-0-input');
+      selectAllInput = document.querySelector('input[type="checkbox"][aria-label*="elect all"]');
       break;
     }
 
     await wait(250);
   }
 
-  if (!nativeInput) {
-    sendStatus('Select All checkbox not found, skipping toggle...');
-  } else {
-    const isChecked = nativeInput.checked;
-
+  if (selectAllInput) {
+    const isChecked = selectAllInput.checked;
     if (isChecked) {
-      nativeInput.click(); // Was checked — one click unchecks it
+      selectAllInput.click(); // Was checked — one click unchecks it
     } else {
-      nativeInput.click(); // Was unchecked — click once to check...
+      selectAllInput.click(); // Was unchecked — click once to check...
       await wait(600);
-      nativeInput.click(); // ...then click again to uncheck
+      selectAllInput.click(); // ...then click again to uncheck
     }
-
     await wait(1500);
     sendStatus('Unchecked Select All button.');
+  } else {
+    // Robust fallback: Find all individual source checkboxes and uncheck them
+    const sourceCheckboxes = document.querySelectorAll('.single-source-container input[type="checkbox"]');
+    if (sourceCheckboxes.length > 0) {
+      let uncheckedCount = 0;
+      sourceCheckboxes.forEach(cb => {
+        if (cb.checked) {
+          cb.click();
+          uncheckedCount++;
+        }
+      });
+      if (uncheckedCount > 0) {
+        await wait(1000);
+        sendStatus(`Unchecked ${uncheckedCount} individual sources.`);
+      } else {
+        sendStatus('All sources were already unchecked.');
+      }
+    } else {
+      sendStatus('Select All checkbox not found, skipping toggle...');
+    }
   }
 
   // ── Step 1.5: Close the Drive upload modal if open ────────────────────

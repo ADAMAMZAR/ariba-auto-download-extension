@@ -33,96 +33,63 @@ chrome.action.onClicked.addListener(async () => {
 });
 
 // -----------------------------------------------------------------------
-// Full-page screenshot via Chrome DevTools Protocol (debugger API)
-// Mirrors exactly how DevTools "Capture full size screenshot" works:
-//   expand viewport → screenshot → restore viewport
+// Full-page screenshot using chrome.debugger
 // -----------------------------------------------------------------------
-
-/** Promisified wrapper for chrome.debugger.sendCommand. */
-function debuggerCmd(target, method, params = {}) {
+function captureFullPageScreenshot(tabId) {
   return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand(target, method, params, (result) => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(result);
+    const target = { tabId };
+    
+    // Check if already attached
+    chrome.debugger.getTargets((targets) => {
+      const isAttached = targets.some(t => t.tabId === tabId && t.attached);
+      if (isAttached) {
+        chrome.debugger.detach(target, attachAndCapture);
+      } else {
+        attachAndCapture();
+      }
     });
-  });
-}
 
-async function captureFullPageScreenshot(tabId, supplierName) {
-  const target = { tabId };
-
-  try {
-    notifyAribaTab(tabId, 'Attaching debugger for screenshot...');
-
-    // 1. Attach debugger
-    await new Promise((resolve, reject) => {
+    function attachAndCapture() {
       chrome.debugger.attach(target, '1.3', () => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve();
-      });
-    });
-
-    // 2. Enable Page domain
-    await debuggerCmd(target, 'Page.enable');
-
-    // 3. Get full page dimensions
-    const metrics = await debuggerCmd(target, 'Page.getLayoutMetrics');
-    const { width, height } = metrics.cssContentSize || metrics.contentSize;
-    const fullW = Math.ceil(width);
-    const fullH = Math.ceil(height);
-
-    notifyAribaTab(tabId, `Capturing full page (${fullW}×${fullH}px)...`);
-
-    // 4. Expand the viewport to the full page size (this is the key step —
-    //    without this, captureBeyondViewport tiles the same viewport repeatedly)
-    await debuggerCmd(target, 'Emulation.setDeviceMetricsOverride', {
-      width: fullW, height: fullH, deviceScaleFactor: 1, mobile: false
-    });
-
-    // Let the layout reflow settle after resize
-    await new Promise(r => setTimeout(r, 300));
-
-    // 5. Capture — viewport is now the full page, so no clip needed
-    const screenshotResult = await debuggerCmd(target, 'Page.captureScreenshot', {
-      format: 'png', captureBeyondViewport: false
-    });
-
-    // 6. Restore original viewport
-    await debuggerCmd(target, 'Emulation.clearDeviceMetricsOverride');
-
-    // 7. Detach debugger
-    await new Promise(resolve => chrome.debugger.detach(target, () => resolve()));
-
-    if (!screenshotResult?.data) {
-      notifyAribaTab(tabId, 'Screenshot capture returned no data.', true);
-      return null;
-    }
-
-    // 8. Save as PNG into the supplier folder
-    const dataUrl = 'data:image/png;base64,' + screenshotResult.data;
-    const filename = `${DOWNLOAD_ROOT}/${supplierName}/${supplierName} - screenshot.png`;
-
-    // Wrap in a Promise so we can capture the downloadId for optional post-upload deletion
-    const screenshotDownloadId = await new Promise((resolve) => {
-      chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, (downloadId) => {
-        if (chrome.runtime.lastError || downloadId === undefined) {
-          notifyAribaTab(tabId, 'Screenshot save failed: ' + (chrome.runtime.lastError?.message ?? 'unknown error'), true);
-          resolve(null);
-        } else {
-          notifyAribaTab(tabId, `Screenshot saved → ${filename}`);
-          resolve(downloadId);
+        if (chrome.runtime.lastError) {
+          return reject(new Error(chrome.runtime.lastError.message));
         }
+
+        chrome.debugger.sendCommand(target, 'Page.enable', {}, () => {
+          chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics', {}, (metrics) => {
+            if (chrome.runtime.lastError) {
+              chrome.debugger.detach(target);
+              return reject(new Error(chrome.runtime.lastError.message));
+            }
+            
+            const contentSize = metrics.cssContentSize || metrics.contentSize;
+            if (!contentSize) {
+              chrome.debugger.detach(target);
+              return reject(new Error("Could not determine page size."));
+            }
+
+            const width = Math.ceil(contentSize.width);
+            const height = Math.ceil(contentSize.height);
+            const clip = { x: 0, y: 0, width, height, scale: 1 };
+            
+            setTimeout(() => {
+              chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
+                format: 'png',
+                clip: clip,
+                captureBeyondViewport: true
+              }, (result) => {
+                chrome.debugger.detach(target);
+                if (chrome.runtime.lastError) {
+                  return reject(new Error(chrome.runtime.lastError.message));
+                }
+                resolve(result.data);
+              });
+            }, 300);
+          });
+        });
       });
-    });
-
-    return { dataUrl, screenshotDownloadId };
-
-  } catch (err) {
-    // Always detach on error to release the tab
-    chrome.debugger.detach(target, () => {});
-    notifyAribaTab(tabId, 'Screenshot error: ' + err.message, true);
-    return null;
-  }
+    }
+  });
 }
 
 // -----------------------------------------------------------------------
@@ -414,7 +381,7 @@ function triggerStop() {
   }
   // 2. Tell the Ariba content script to stop its own loops
   if (_activeAribaTabId) {
-    chrome.tabs.sendMessage(_activeAribaTabId, { action: 'stopAutomation' }).catch(() => {});
+    chrome.tabs.sendMessage(_activeAribaTabId, { action: 'stopAutomation' }).catch(() => { });
     _activeAribaTabId = null;
   }
 }
@@ -539,7 +506,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     let extracted = match[1].replace(/['"]/g, '').trim();
                     // Some servers illegally URL-encode the standard filename attribute
                     if (extracted.includes('%')) {
-                      try { extracted = decodeURIComponent(extracted); } catch (e) {}
+                      try { extracted = decodeURIComponent(extracted); } catch (e) { }
                     }
                     if (extracted) realFilename = extracted;
                   }
@@ -617,33 +584,98 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           if (stopSignal.aborted) throw new Error('Stopped by user.');
 
-          notifyAribaTab(tabId,
-            `Queued ${files.length} file(s) for download. Taking full-page screenshot...`);
+          if (request.extractedQAData && request.extractedQAData.length > 0) {
+            notifyAribaTab(tabId, 'Generating QA markdown document...');
 
-          // Hide toasts so they don't appear in the screenshot
-          if (tabId) chrome.tabs.sendMessage(tabId, { action: 'hideToasts' }).catch(() => {});
+            let qaText = `# Supplier: ${s}\n\n`;
+            let currentSection = '';
 
-          let screenshotResult = null;
-          if (tabId) {
-            screenshotResult = await captureFullPageScreenshot(tabId, s);
-          } else {
-            notifyAribaTab(tabId, 'Could not determine Ariba tab for screenshot.', true);
-          }
+            request.extractedQAData.forEach((qaBlock) => {
+              if (qaBlock.sectionLabel && qaBlock.sectionLabel !== currentSection) {
+                currentSection = qaBlock.sectionLabel;
+                qaText += `## ${currentSection}\n\n`;
+              }
 
-          // Restore toasts
-          if (tabId) chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
+              if (qaBlock.questionLabel) {
+                qaText += `### ${qaBlock.questionLabel}\n\n`;
+              }
+              if (qaBlock.attachedFile) {
+                qaText += `**Attached File:** \`${s} - ${qaBlock.attachedFile}\`\n\n`;
+              }
 
-          // screenshotResult is { dataUrl, screenshotDownloadId } or null
-          if (screenshotResult?.dataUrl && nlmEnabled) {
-            filesForNotebook.push({
-              filename: `${s} - screenshot.png`,
-              dataUrl: screenshotResult.dataUrl,
-              mimeType: 'image/png'
+              qaBlock.answers.forEach(ans => {
+                qaText += `- **${ans.label}:** ${ans.value}\n`;
+              });
+              qaText += `\n---\n\n`;
             });
-          }
-          // Track the screenshot's disk file ID for optional deletion
-          if (screenshotResult?.screenshotDownloadId != null) {
-            diskDownloadIds.push(screenshotResult.screenshotDownloadId);
+
+            const utf8Bytes = new TextEncoder().encode(qaText);
+            const base64Text = uint8ArrayToBase64(utf8Bytes);
+            const dataUrl = `data:text/markdown;base64,${base64Text}`;
+            
+            const qaFilename = `${s} - QA_Data.md`;
+            
+            if (nlmEnabled) {
+              filesForNotebook.push({
+                filename: qaFilename,
+                dataUrl: dataUrl,
+                mimeType: 'text/markdown'
+              });
+            }
+
+            const destQaFilename = `${DOWNLOAD_ROOT}/${s}/${qaFilename}`;
+            const qaDownloadId = await new Promise((resolve) => {
+              chrome.downloads.download({ url: dataUrl, filename: destQaFilename, saveAs: false }, (downloadId) => {
+                if (chrome.runtime.lastError || downloadId === undefined) {
+                  notifyAribaTab(tabId, `Disk download failed for QA markdown document`, true);
+                  resolve(null);
+                } else {
+                  notifyAribaTab(tabId, `Saved Q&A data → ${destQaFilename}`);
+                  resolve(downloadId);
+                }
+              });
+            });
+            
+            if (qaDownloadId != null) {
+              diskDownloadIds.push(qaDownloadId);
+            }
+
+            // --- Capture Full Page Screenshot ---
+            if (tabId) {
+              notifyAribaTab(tabId, 'Taking full-page screenshot...');
+              try {
+                chrome.tabs.sendMessage(tabId, { action: 'hideToasts' }).catch(() => {});
+                await new Promise(r => setTimeout(r, 150));
+                
+                const base64Png = await captureFullPageScreenshot(tabId);
+                
+                chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
+                
+                const imgDataUrl = `data:image/png;base64,${base64Png}`;
+                const imgFilename = `${s} - Screenshot.png`;
+                const destImgFilename = `${DOWNLOAD_ROOT}/${s}/${imgFilename}`;
+                
+                const imgDownloadId = await new Promise((resolve) => {
+                  chrome.downloads.download({ url: imgDataUrl, filename: destImgFilename, saveAs: false }, (downloadId) => {
+                    if (chrome.runtime.lastError || downloadId === undefined) {
+                      notifyAribaTab(tabId, `Disk download failed for screenshot`, true);
+                      resolve(null);
+                    } else {
+                      notifyAribaTab(tabId, `Saved Screenshot → ${destImgFilename}`);
+                      resolve(downloadId);
+                    }
+                  });
+                });
+
+                if (imgDownloadId != null) {
+                  diskDownloadIds.push(imgDownloadId);
+                }
+              } catch (err) {
+                console.warn('[Ariba Ext] Screenshot failed:', err);
+                notifyAribaTab(tabId, `Screenshot failed: ${err.message}`, true);
+                chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
+              }
+            }
           }
 
           const state = await getState(s);
@@ -661,12 +693,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } catch (err) {
         // Covers timeout, stop-by-user, and unexpected throws
         const tabId = sender.tab?.id;
-        if (tabId) chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
+        if (tabId) chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => { });
         const isStopped = err.message === 'Stopped by user.';
         notifyAribaTab(tabId, isStopped ? 'Download stopped by user.' : 'Error: ' + err.message, true);
         notifyPanel(isStopped ? 'Stopped by user.' : 'Error: ' + err.message, true, true);
         // Clear any stale session state so the next run starts clean
-        if (supplierKey) clearState(supplierKey).catch(() => {});
+        if (supplierKey) clearState(supplierKey).catch(() => { });
       } finally {
         clearTimeout(timeoutHandle);
         clearStopSignal();

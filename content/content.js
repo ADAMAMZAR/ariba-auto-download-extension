@@ -35,6 +35,22 @@
     }, 4000);
   }
 
+  // ── Only run in the relevant Ariba frame ──────────────────────────────
+  const allButtons = Array.from(document.querySelectorAll('[aria-label="expand"]'));
+  const supplierElement = document.querySelector('.supplier-name');
+  const allAnchors = Array.from(document.querySelectorAll('.file-name-container a.file-name'));
+
+  console.log('[Ariba Ext] Initial check:', {
+    allButtons: allButtons.length,
+    supplierElement: !!supplierElement,
+    allAnchors: allAnchors.length
+  });
+
+  if (allButtons.length === 0 && !supplierElement && allAnchors.length === 0) {
+    window.__aribaAutomationRunning = false;
+    return;
+  }
+
   // ── Listen for toast messages from the background script ──────────────
   if (!window.hasAribaToastListener) {
     window.hasAribaToastListener = true;
@@ -56,19 +72,6 @@
       }
     });
   }
-
-  // ── Only run in the relevant Ariba frame ──────────────────────────────
-  const allButtons = Array.from(document.querySelectorAll('[aria-label="expand"]'));
-  const supplierElement = document.querySelector('.supplier-name');
-  const allAnchors = Array.from(document.querySelectorAll('.file-name-container a.file-name'));
-
-  console.log('[Ariba Ext] Initial check:', {
-    allButtons: allButtons.length,
-    supplierElement: !!supplierElement,
-    allAnchors: allAnchors.length
-  });
-
-  if (allButtons.length === 0 && !supplierElement && allAnchors.length === 0) return;
 
   // ── Scope detection ───────────────────────────────────────────────
   // If the page has .content-2, only target that (updated questionnaire).
@@ -181,8 +184,82 @@
       files.push({ url: a.href, filename: a.getAttribute('download') || a.textContent.trim() || 'document.pdf' });
     });
 
+    // Step 2.5: Extract QA text from expanded sections
+    showToast('Extracting Q&A data...');
+    const extractedQAData = [];
+    const processedContainers = new Set();
+    
+    // Use a fresh query because the original buttons might have been destroyed/replaced by Angular
+    const currentExpansionButtons = Array.from(document.querySelectorAll('.expansion-button, [aria-label="collapse"], [aria-label="expand"]'));
+    console.log('[Ariba Ext] Found', currentExpansionButtons.length, 'expansion buttons for text extraction.');
+
+    for (const btn of currentExpansionButtons) {
+      let mainContainer = btn.closest('[flexlayout="row"]');
+      if (!mainContainer) {
+        mainContainer = btn.closest('.smq-item-container') || btn.closest('.renderer-container');
+      }
+      
+      if (!mainContainer || processedContainers.has(mainContainer)) continue;
+      processedContainers.add(mainContainer);
+
+      const qaBlock = { sectionLabel: '', questionLabel: '', answers: [], attachedFile: '' };
+
+      const sectionContainer = mainContainer.closest('.smq-section-item-container');
+      if (sectionContainer) {
+        const sectionLabelSpan = sectionContainer.querySelector('.view-mode-header .label-span');
+        if (sectionLabelSpan) {
+           qaBlock.sectionLabel = sectionLabelSpan.textContent.replace(/\s+/g, ' ').trim();
+        }
+      }
+
+      const labelSpan = mainContainer.querySelector('.label-span');
+      if (labelSpan) qaBlock.questionLabel = labelSpan.textContent.replace(/\s+/g, ' ').trim();
+
+      let contentBlock = mainContainer.querySelector('.content-2, [content2]');
+      if (!contentBlock || !contentBlock.querySelector('.row-container')) {
+         contentBlock = mainContainer.querySelector('.content-1, [content1]') || mainContainer;
+      }
+
+      const rows = contentBlock.querySelectorAll('.row-container');
+      rows.forEach(row => {
+        const rowLabelEl = row.querySelector('.row-label');
+        const rowContentEl = row.querySelector('.row-content');
+        if (rowLabelEl && rowContentEl) {
+          const l = rowLabelEl.textContent.trim();
+          const c = rowContentEl.textContent.trim();
+          
+          if (l === 'Description') return;
+
+          if (l) {
+             qaBlock.answers.push({ label: l, value: c });
+          }
+        }
+      });
+
+      const certTypeAnswer = qaBlock.answers.find(a => a.label === 'Certificate Type');
+      if (certTypeAnswer && !certTypeAnswer.value) {
+         let derivedType = qaBlock.questionLabel;
+         derivedType = derivedType.replace(/^\d+\.\d+\s+/, '');
+         derivedType = derivedType.replace(/^Certificate of\s+/i, '');
+         derivedType = derivedType.replace(/\([^)]+\)/g, '');
+         derivedType = derivedType.split('-')[0];
+         certTypeAnswer.value = derivedType.trim();
+      }
+
+      const fileAnchor = contentBlock.querySelector('.file-name-container a.file-name');
+      if (fileAnchor) {
+        qaBlock.attachedFile = fileAnchor.getAttribute('download') || fileAnchor.textContent.trim();
+      }
+      
+      if (qaBlock.questionLabel || qaBlock.answers.length > 0 || qaBlock.attachedFile) {
+        extractedQAData.push(qaBlock);
+      }
+    }
+
+    console.log('[Ariba Ext] Extracted QA Data:', extractedQAData);
+
     // Step 3: Send to background for disk download
-    chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, files });
+    chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, files, extractedQAData });
     showToast('Files sent for download. Processing...');
   } catch (err) {
     if (err.message !== 'Stopped by user.') {
