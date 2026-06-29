@@ -126,11 +126,23 @@
     showToast('Found Ariba content. Processing...');
 
     let supplierName = 'Unknown Supplier';
+    let rawSupplierName = 'Unknown Supplier';
     if (supplierElement) {
-      supplierName = supplierElement.textContent.trim()
+      rawSupplierName = supplierElement.textContent.trim();
+      supplierName = rawSupplierName
+        .replace(/PTY LIMITED/gi, 'P/L')
+        .replace(/PTY LTD\.?/gi, 'P/L')
+        .replace(/The trustee of\s+/gi, 'TOF ')
+        .replace(/The trustee for\s+/gi, 'TOF ')
         .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem chars
         .replace(/\.+$/, '')              // Windows: no trailing periods
         .trim();
+    }
+
+    let workspaceTitle = 'Questionnaire';
+    const titleElement = document.getElementById('workspace-title');
+    if (titleElement) {
+      workspaceTitle = titleElement.textContent.trim();
     }
 
     // Step 1: Expand all sections
@@ -188,7 +200,7 @@
     showToast('Extracting Q&A data...');
     const extractedQAData = [];
     const processedContainers = new Set();
-    
+
     // Use a fresh query because the original buttons might have been destroyed/replaced by Angular
     const currentExpansionButtons = Array.from(document.querySelectorAll('.expansion-button, [aria-label="collapse"], [aria-label="expand"]'));
     console.log('[Ariba Ext] Found', currentExpansionButtons.length, 'expansion buttons for text extraction.');
@@ -198,7 +210,7 @@
       if (!mainContainer) {
         mainContainer = btn.closest('.smq-item-container') || btn.closest('.renderer-container');
       }
-      
+
       if (!mainContainer || processedContainers.has(mainContainer)) continue;
       processedContainers.add(mainContainer);
 
@@ -208,7 +220,7 @@
       if (sectionContainer) {
         const sectionLabelSpan = sectionContainer.querySelector('.view-mode-header .label-span');
         if (sectionLabelSpan) {
-           qaBlock.sectionLabel = sectionLabelSpan.textContent.replace(/\s+/g, ' ').trim();
+          qaBlock.sectionLabel = sectionLabelSpan.textContent.replace(/\s+/g, ' ').trim();
         }
       }
 
@@ -217,7 +229,7 @@
 
       let contentBlock = mainContainer.querySelector('.content-2, [content2]');
       if (!contentBlock || !contentBlock.querySelector('.row-container')) {
-         contentBlock = mainContainer.querySelector('.content-1, [content1]') || mainContainer;
+        contentBlock = mainContainer.querySelector('.content-1, [content1]') || mainContainer;
       }
 
       const rows = contentBlock.querySelectorAll('.row-container');
@@ -227,30 +239,30 @@
         if (rowLabelEl && rowContentEl) {
           const l = rowLabelEl.textContent.trim();
           const c = rowContentEl.textContent.trim();
-          
+
           if (l === 'Description') return;
 
           if (l) {
-             qaBlock.answers.push({ label: l, value: c });
+            qaBlock.answers.push({ label: l, value: c });
           }
         }
       });
 
       const certTypeAnswer = qaBlock.answers.find(a => a.label === 'Certificate Type');
       if (certTypeAnswer && !certTypeAnswer.value) {
-         let derivedType = qaBlock.questionLabel;
-         derivedType = derivedType.replace(/^\d+\.\d+\s+/, '');
-         derivedType = derivedType.replace(/^Certificate of\s+/i, '');
-         derivedType = derivedType.replace(/\([^)]+\)/g, '');
-         derivedType = derivedType.split('-')[0];
-         certTypeAnswer.value = derivedType.trim();
+        let derivedType = qaBlock.questionLabel;
+        derivedType = derivedType.replace(/^\d+\.\d+\s+/, '');
+        derivedType = derivedType.replace(/^Certificate of\s+/i, '');
+        derivedType = derivedType.replace(/\([^)]+\)/g, '');
+        derivedType = derivedType.split('-')[0];
+        certTypeAnswer.value = derivedType.trim();
       }
 
       const fileAnchor = contentBlock.querySelector('.file-name-container a.file-name');
       if (fileAnchor) {
         qaBlock.attachedFile = fileAnchor.getAttribute('download') || fileAnchor.textContent.trim();
       }
-      
+
       if (qaBlock.questionLabel || qaBlock.answers.length > 0 || qaBlock.attachedFile) {
         extractedQAData.push(qaBlock);
       }
@@ -259,7 +271,7 @@
     console.log('[Ariba Ext] Extracted QA Data:', extractedQAData);
 
     // Step 3: Send to background for disk download
-    chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, files, extractedQAData });
+    chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, rawSupplierName, workspaceTitle, files, extractedQAData });
     showToast('Files sent for download. Processing...');
   } catch (err) {
     if (err.message !== 'Stopped by user.') {

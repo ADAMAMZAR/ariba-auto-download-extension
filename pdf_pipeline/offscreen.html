@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <!--
+    Offscreen Document — PDF Text Extraction
+    ─────────────────────────────────────────
+    This hidden page is created by the service worker via chrome.offscreen.createDocument().
+    It has full DOM access and can run pdf.js Web Workers, unlike the service worker itself.
+
+    Load order is critical:
+      1. pdf.min.js  — exposes window.pdfjsLib (UMD global)
+      2. offscreen.js — uses pdfjsLib, listens for EXTRACT_PDF_TEXT messages
+  -->
+  <script src="pdf.min.js"></script>
+  <script src="offscreen.js"></script>
+</head>
+<body></body>
+</html>

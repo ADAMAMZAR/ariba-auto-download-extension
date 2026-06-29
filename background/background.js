@@ -1,6 +1,13 @@
 // Load shared logger first, then constants
 importScripts('../shared/logger.js');
 importScripts('../shared/constants.js');
+// PDF extraction bridge — manages the Offscreen Document that runs pdf.js
+// (pdf.js itself cannot run in a service worker; it needs DOM + Worker access)
+try {
+  importScripts('../pdf_pipeline/pdf_extractor.js');
+} catch (e) {
+  console.warn('[Ariba Ext] pdf_extractor.js failed to load — PDF→TXT disabled:', e?.message ?? e);
+}
 
 
 // Open standalone panel window when extension icon is clicked
@@ -38,7 +45,7 @@ chrome.action.onClicked.addListener(async () => {
 function captureFullPageScreenshot(tabId) {
   return new Promise((resolve, reject) => {
     const target = { tabId };
-    
+
     // Check if already attached
     chrome.debugger.getTargets((targets) => {
       const isAttached = targets.some(t => t.tabId === tabId && t.attached);
@@ -61,7 +68,7 @@ function captureFullPageScreenshot(tabId) {
               chrome.debugger.detach(target);
               return reject(new Error(chrome.runtime.lastError.message));
             }
-            
+
             const contentSize = metrics.cssContentSize || metrics.contentSize;
             if (!contentSize) {
               chrome.debugger.detach(target);
@@ -71,7 +78,7 @@ function captureFullPageScreenshot(tabId) {
             const width = Math.ceil(contentSize.width);
             const height = Math.ceil(contentSize.height);
             const clip = { x: 0, y: 0, width, height, scale: 1 };
-            
+
             setTimeout(() => {
               chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
                 format: 'png',
@@ -146,6 +153,10 @@ function notifyPanel(text, error = false, done = false) {
 function cleanName(n) {
   return n
     .replace(/["']/g, '')              // Strip quotes completely instead of making them dashes
+    .replace(/PTY LIMITED/gi, 'P/L')
+    .replace(/PTY LTD\.?/gi, 'P/L')
+    .replace(/The trustee of\s+/gi, 'TOF ')
+    .replace(/The trustee for\s+/gi, 'TOF ')
     .replace(/[\/\\?%*:|<>]/g, '-')    // Replace illegal filesystem characters with dashes
     .replace(/\.+$/, '')               // Windows: names cannot end with a period
     .trim();                           // no leading/trailing spaces
@@ -252,8 +263,15 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
   const state = await getState(supplier);
   if (!state.filesDone) return;
 
-  if (!state.config?.connectToNotebooklm) {
-    // NLM disabled — clear state now and we're done
+  // Check if we should skip NotebookLM (either disabled, or no valid files to upload other than QA data)
+  const hasOnlyQaFile = filesForNotebook.length === 1 && filesForNotebook[0].filename.endsWith('QA_Data.md');
+  const skipNotebookLm = !state.config?.connectToNotebooklm || filesForNotebook.length === 0 || hasOnlyQaFile;
+
+  if (skipNotebookLm) {
+    // NLM disabled or nothing to upload — clear state now and we're done
+    if (hasOnlyQaFile) {
+      notifyPanel('Only QA Markdown available. Skipping NotebookLM upload.');
+    }
     await clearState(supplier);
     notifyAribaTab(state.aribaTabId, 'Downloads complete!');
     notifyPanel('Downloads complete!', false, true);
@@ -544,13 +562,91 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               usedFilenames.add(uniqueFilename.toLowerCase());
               realFilename = uniqueFilename;
 
-              if (nlmEnabled) {
-                dataUrl = await blobToDataUrl(blob);
-                filesForNotebook.push({
-                  filename: `${s} - ${cleanName(realFilename)}`,
-                  dataUrl,
-                  mimeType
-                });
+              // ── PDF → TXT conversion ─────────────────────────────────────
+              const isPdf = mimeType.includes('pdf') ||
+                realFilename.toLowerCase().endsWith('.pdf');
+
+              if (isPdf && typeof extractTextFromPdfBuffer === 'function') {
+                notifyAribaTab(tabId, `Extracting text from "${realFilename}"...`);
+                try {
+                  const arrayBuf = await blob.arrayBuffer();
+                  const { text, isScanned, isPasswordProtected } = await extractTextFromPdfBuffer(arrayBuf);
+
+                  if (isPasswordProtected) {
+                    notifyAribaTab(tabId, `Skipped uploading "${realFilename}" to NotebookLM (password protected).`, true);
+                    notifyPanel(`Skipped NotebookLM upload for "${realFilename}" (password protected).`, true);
+                  } else if (!isScanned) {
+                    // ── Scanned OK: save .txt to disk + send .txt to NLM ────
+                    const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
+                    const txtDataUrl = textToDataUrl(text);
+
+                    // Save .txt alongside original PDF on disk
+                    const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
+                    const txtDownloadId = await new Promise((resolve) => {
+                      chrome.downloads.download(
+                        { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
+                        (dlId) => {
+                          if (chrome.runtime.lastError || dlId === undefined) {
+                            notifyAribaTab(tabId, `TXT save failed for "${txtFilename}"`, true);
+                            resolve(null);
+                          } else {
+                            notifyAribaTab(tabId, `Saved TXT → ${destTxtFilename}`);
+                            resolve(dlId);
+                          }
+                        }
+                      );
+                    });
+                    if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
+
+                    // Send .txt (not the PDF) to NotebookLM
+                    if (nlmEnabled) {
+                      filesForNotebook.push({
+                        filename: `${s} - ${cleanName(txtFilename)}`,
+                        dataUrl: txtDataUrl,
+                        mimeType: 'text/plain'
+                      });
+                    }
+
+                  } else {
+                    // ── Scanned image: no text layer — fall back to PDF ──────
+                    notifyAribaTab(tabId,
+                      `"${realFilename}" has no text layer (scanned image). ` +
+                      `Uploading original PDF to NotebookLM as fallback.`, true);
+                    if (nlmEnabled) {
+                      dataUrl = await blobToDataUrl(blob);
+                      filesForNotebook.push({
+                        filename: `${s} - ${cleanName(realFilename)}`,
+                        dataUrl,
+                        mimeType
+                      });
+                    }
+                  }
+
+                } catch (pdfErr) {
+                  // Extraction failed unexpectedly — fall back to original PDF
+                  notifyAribaTab(tabId,
+                    `TXT extraction failed for "${realFilename}": ${pdfErr.message}. ` +
+                    `Using original PDF.`, true);
+                  if (nlmEnabled) {
+                    dataUrl = await blobToDataUrl(blob);
+                    filesForNotebook.push({
+                      filename: `${s} - ${cleanName(realFilename)}`,
+                      dataUrl,
+                      mimeType
+                    });
+                  }
+                }
+
+              } else {
+                // ── Non-PDF file: original behaviour unchanged ───────────────
+                if (nlmEnabled) {
+                  dataUrl = await blobToDataUrl(blob);
+                  filesForNotebook.push({
+                    filename: `${s} - ${cleanName(realFilename)}`,
+                    dataUrl,
+                    mimeType
+                  });
+                }
               }
 
             } catch (err) {
@@ -587,7 +683,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (request.extractedQAData && request.extractedQAData.length > 0) {
             notifyAribaTab(tabId, 'Generating QA markdown document...');
 
-            let qaText = `# Supplier: ${s}\n\n`;
+            const originalSupplierName = request.rawSupplierName || request.supplierName || 'Ariba';
+            const wTitle = request.workspaceTitle || 'Questionnaire';
+            let qaText = `# ${wTitle}\n\n## Supplier: ${originalSupplierName}\n\n`;
             let currentSection = '';
 
             request.extractedQAData.forEach((qaBlock) => {
@@ -612,9 +710,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const utf8Bytes = new TextEncoder().encode(qaText);
             const base64Text = uint8ArrayToBase64(utf8Bytes);
             const dataUrl = `data:text/markdown;base64,${base64Text}`;
-            
+
             const qaFilename = `${s} - QA_Data.md`;
-            
+
             if (nlmEnabled) {
               filesForNotebook.push({
                 filename: qaFilename,
@@ -635,7 +733,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 }
               });
             });
-            
+
             if (qaDownloadId != null) {
               diskDownloadIds.push(qaDownloadId);
             }
@@ -644,17 +742,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             if (tabId) {
               notifyAribaTab(tabId, 'Taking full-page screenshot...');
               try {
-                chrome.tabs.sendMessage(tabId, { action: 'hideToasts' }).catch(() => {});
+                chrome.tabs.sendMessage(tabId, { action: 'hideToasts' }).catch(() => { });
                 await new Promise(r => setTimeout(r, 150));
-                
+
                 const base64Png = await captureFullPageScreenshot(tabId);
-                
-                chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
-                
+
+                chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => { });
+
                 const imgDataUrl = `data:image/png;base64,${base64Png}`;
                 const imgFilename = `${s} - Screenshot.png`;
                 const destImgFilename = `${DOWNLOAD_ROOT}/${s}/${imgFilename}`;
-                
+
                 const imgDownloadId = await new Promise((resolve) => {
                   chrome.downloads.download({ url: imgDataUrl, filename: destImgFilename, saveAs: false }, (downloadId) => {
                     if (chrome.runtime.lastError || downloadId === undefined) {
@@ -673,7 +771,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               } catch (err) {
                 console.warn('[Ariba Ext] Screenshot failed:', err);
                 notifyAribaTab(tabId, `Screenshot failed: ${err.message}`, true);
-                chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => {});
+                chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => { });
               }
             }
           }
