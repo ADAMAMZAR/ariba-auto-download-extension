@@ -29,7 +29,12 @@ var NLM_UPLOAD_BASE = 'https://notebooklm.google.com/upload/_/';
 
 // System instructions are fetched from this GitHub Gist so they can be
 // updated without releasing a new extension version.
-var GIST_URL = 'https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1bedfe76caf59f3/raw/gistfile1.txt';
+var GIST_URL = 'https://gist.githubusercontent.com/adamamzar15/a52b9242d6f8663f38595e1921ed540e/raw/system-instruction';
+
+// ── iLovePDF OCR API (disabled — uncomment to enable) ──────────────────────
+// Used ONLY for PDFs where pdf.js extraction returns isScanned: true
+// (garbled font encoding or empty text layer) to conserve API credits.
+// var ILOVEPDF_PUBLIC_KEY = 'project_public_62aed7fd9f1c6bf24008417bfd924a40__JOik5a7bfd777119aaace8828465ab9aa8af';
 
 // ── Extension behaviour ───────────────────────────────────────────────
 // Root folder used for all downloads (matches the extension name shown in Chrome)

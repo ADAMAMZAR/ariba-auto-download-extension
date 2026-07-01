@@ -8,6 +8,84 @@ try {
 } catch (e) {
   console.warn('[Ariba Ext] pdf_extractor.js failed to load — PDF→TXT disabled:', e?.message ?? e);
 }
+// ── iLovePDF OCR (disabled — uncomment to enable) ───────────────────────────
+// try {
+//   importScripts('../pdf_pipeline/ilovepdf_ocr.js');
+// } catch (e) {
+//   console.warn('[Ariba Ext] ilovepdf_ocr.js failed to load — OCR fallback disabled:', e?.message ?? e);
+// }
+
+// ─── Auto-Update ──────────────────────────────────────────────────────────────
+// Chrome auto-updates extensions from the Web Store, but only applies the
+// update when all extension tabs are closed or the browser restarts.
+// Users who keep Chrome open all day can unknowingly run stale code for days.
+//
+// Fix: use chrome.alarms to wake the service worker every hour and actively
+// call requestUpdateCheck().  When Chrome confirms an update is ready,
+// onUpdateAvailable fires and we reload immediately.
+
+const UPDATE_ALARM = 'gpo-auto-update-check';
+
+// Register the hourly alarm once on install/startup.
+// chrome.alarms.create is idempotent if the alarm already exists.
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(UPDATE_ALARM, { periodInMinutes: 60 });
+  console.log('[Ariba Ext] Auto-update alarm registered (every 60 min).');
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  chrome.alarms.create(UPDATE_ALARM, { periodInMinutes: 60 });
+});
+
+// Every hour: ask Chrome if a newer version is available in the Web Store.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== UPDATE_ALARM) return;
+  chrome.runtime.requestUpdateCheck((status) => {
+    console.log(`[Ariba Ext] Update check → ${status}`);
+    // 'update_available' means Chrome already downloaded the new version;
+    // onUpdateAvailable will fire and we reload there.
+    // 'no_update' / 'throttled' → nothing to do.
+  });
+});
+
+// When Chrome has a new version ready, decide whether to reload immediately
+// or defer until the active job finishes.
+//
+// _stopController is null when no download job is running (defined below at
+// the Stop Signal section).  We reference it via a getter so the hoisting
+// order doesn't matter — by the time onUpdateAvailable fires at runtime,
+// _stopController is always initialised.
+chrome.runtime.onUpdateAvailable.addListener((details) => {
+  const newVersion = details.version;
+  const jobIsActive = typeof _stopController !== 'undefined' && _stopController !== null;
+
+  if (jobIsActive) {
+    // ── A download is in progress — do NOT interrupt it ────────────────────
+    // Notify the user in the panel so they know an update is queued.
+    // Chrome will apply the update automatically the next time the browser
+    // restarts or all extension pages are closed.
+    console.log(`[Ariba Ext] Update v${newVersion} available — deferring (job in progress).`);
+    notifyPanel(
+      `⬆️ Extension update v${newVersion} is ready but will apply after your ` +
+      `current download finishes (or on next browser restart).`,
+      false,  // not an error
+      false   // not done
+    );
+  } else {
+    // ── Idle — safe to reload.  Warn the user first, then reload. ──────────
+    console.log(`[Ariba Ext] Update v${newVersion} available — reloading in 4 s.`);
+    notifyPanel(
+      `⬆️ Extension update v${newVersion} detected! Reloading in 4 seconds — ` +
+      `please reopen this panel afterwards.`,
+      false,
+      false
+    );
+    setTimeout(() => {
+      chrome.runtime.reload();
+    }, 4000); // 4-second window so the user can read the message
+  }
+});
+
 
 
 // Open standalone panel window when extension icon is clicked
@@ -608,7 +686,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     }
 
                   } else {
-                    // ── Scanned image: no text layer — fall back to PDF ──────
+                    // ── Scanned / garbled: no readable text layer — fall back to PDF ────
                     notifyAribaTab(tabId,
                       `"${realFilename}" has no text layer (scanned image). ` +
                       `Uploading original PDF to NotebookLM as fallback.`, true);
@@ -620,6 +698,67 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         mimeType
                       });
                     }
+
+                    // ── iLovePDF OCR (disabled — uncomment block below to enable) ────────
+                    // When enabled: OCRs the PDF via iLovePDF API, re-extracts text,
+                    // saves .txt to disk and sends .txt to NLM instead of raw PDF.
+                    // Requires: ilovepdf_ocr.js importScripts (top of file) + manifest
+                    // host_permissions for api.ilovepdf.com + *.ilovepdf.com.
+                    //
+                    // notifyAribaTab(tabId,
+                    //   `"${realFilename}" has no readable text — running OCR via iLovePDF...`);
+                    // notifyPanel(`Running OCR on "${realFilename}"...`);
+                    // try {
+                    //   if (typeof ocrPdfWithIlovePdf !== 'function') {
+                    //     throw new Error('iLovePDF OCR module not loaded.');
+                    //   }
+                    //   const ocrBlob     = await ocrPdfWithIlovePdf(blob, realFilename);
+                    //   const ocrArrayBuf = await ocrBlob.arrayBuffer();
+                    //   const { text: ocrText, isScanned: stillScanned } =
+                    //     await extractTextFromPdfBuffer(ocrArrayBuf);
+                    //   if (stillScanned || !ocrText.trim()) {
+                    //     throw new Error('OCR produced no readable text.');
+                    //   }
+                    //   const txtFilename     = realFilename.replace(/\.pdf$/i, '.txt');
+                    //   const txtDataUrl      = textToDataUrl(ocrText);
+                    //   const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
+                    //   notifyAribaTab(tabId, `OCR complete for "${realFilename}" — saving as TXT.`);
+                    //   const ocrTxtDownloadId = await new Promise((resolve) => {
+                    //     chrome.downloads.download(
+                    //       { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
+                    //       (dlId) => {
+                    //         if (chrome.runtime.lastError || dlId === undefined) {
+                    //           notifyAribaTab(tabId, `OCR TXT save failed for "${txtFilename}"`, true);
+                    //           resolve(null);
+                    //         } else {
+                    //           notifyAribaTab(tabId, `Saved OCR TXT → ${destTxtFilename}`);
+                    //           resolve(dlId);
+                    //         }
+                    //       }
+                    //     );
+                    //   });
+                    //   if (ocrTxtDownloadId != null) diskDownloadIds.push(ocrTxtDownloadId);
+                    //   if (nlmEnabled) {
+                    //     filesForNotebook.push({
+                    //       filename: `${s} - ${cleanName(txtFilename)}`,
+                    //       dataUrl:  txtDataUrl,
+                    //       mimeType: 'text/plain'
+                    //     });
+                    //   }
+                    // } catch (ocrErr) {
+                    //   notifyAribaTab(tabId,
+                    //     `OCR failed for "${realFilename}" (${ocrErr.message}). ` +
+                    //     `Uploading original PDF to NotebookLM as fallback.`, true);
+                    //   notifyPanel(`OCR failed for "${realFilename}" — using original PDF.`, true);
+                    //   if (nlmEnabled) {
+                    //     dataUrl = await blobToDataUrl(blob);
+                    //     filesForNotebook.push({
+                    //       filename: `${s} - ${cleanName(realFilename)}`,
+                    //       dataUrl,
+                    //       mimeType
+                    //     });
+                    //   }
+                    // }
                   }
 
                 } catch (pdfErr) {

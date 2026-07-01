@@ -256,6 +256,44 @@ def _extract_text_from_pdf(pdf_path: Path) -> tuple[str, bool]:
 
     full_text = "\n\n".join(pages_text)
     is_scanned = not full_text.strip()  # empty → no machine-readable text layer
+
+    # ── Garbled-text guard 1: U+FFFD replacement characters ──────────────────
+    # Some PDFs embed fonts without a /ToUnicode map; pdfplumber emits U+FFFD
+    # instead of real text.  >30 % replacement chars = unusable.
+    if not is_scanned and full_text.strip():
+        replacement_count = full_text.count("\ufffd")
+        replacement_ratio = replacement_count / max(len(full_text), 1)
+        if replacement_ratio > 0.3:
+            logger.warning(
+                "Font encoding failure (U+FFFD) in '%s' — %.1f%% replacement chars. "
+                "Flagging as unreadable (is_scanned=True).",
+                pdf_path.name,
+                replacement_ratio * 100,
+            )
+            is_scanned = True
+
+    # ── Garbled-text guard 2: wrong-encoding symbol soup ─────────────────────
+    # A different failure mode: the font has a custom /Encoding vector that maps
+    # glyphs to the WRONG Unicode characters (e.g. letters → punctuation/symbols).
+    # pdfplumber decodes without errors, but output looks like:
+    #   `!  "#! !$!$  #  %  &  '  ()` — almost no real letters at all.
+    # Legitimate insurance/workcover PDFs should be >15 % alphabetic characters.
+    if not is_scanned and full_text.strip():
+        non_ws = re.sub(r"\s", "", full_text)
+        if len(non_ws) > 50:
+            letter_count = sum(1 for c in non_ws if c.isalpha())
+            letter_ratio = letter_count / len(non_ws)
+            if letter_ratio < 0.15:
+                logger.warning(
+                    "Wrong font encoding detected in '%s' — only %.1f%% alphabetic chars "
+                    "(expected >15%%).  Font likely uses a custom /Encoding vector that "
+                    "maps glyphs to wrong Unicode codepoints.  "
+                    "Flagging as unreadable (is_scanned=True).",
+                    pdf_path.name,
+                    letter_ratio * 100,
+                )
+                is_scanned = True
+
     return full_text, is_scanned
 
 

@@ -113,6 +113,40 @@ async function extractText(uint8Array) {
 
   const raw = rawPages.join('\n\n');
   if (!raw.trim()) return { text: '', isScanned: true };
+
+  // ── Garbled-text guard 1: U+FFFD replacement characters ─────────────────
+  // Some PDFs have fonts with no /ToUnicode map, so pdf.js emits U+FFFD
+  // instead of real text.  >30 % replacement chars = unusable.
+  const replacementCount = (raw.match(/\ufffd/g) || []).length;
+  const replacementRatio = replacementCount / Math.max(raw.length, 1);
+  if (replacementRatio > 0.3) {
+    console.warn(
+      `[Offscreen] Font encoding failure (U+FFFD) — ` +
+      `${(replacementRatio * 100).toFixed(1)}% replacement chars. ` +
+      `Flagging as isScanned.`
+    );
+    return { text: '', isScanned: true };
+  }
+
+  // ── Garbled-text guard 2: wrong-encoding symbol soup ─────────────────────
+  // A different failure mode: the font has a custom /Encoding vector that maps
+  // every glyph to the WRONG Unicode character (e.g. letters → punctuation).
+  // pdf.js decodes without errors, but the output is almost entirely symbols
+  // like `!  "#! !$!$  #  %  &  '  ()` with almost no real letters.
+  // Legitimate insurance/workcover PDFs must be >15 % alphabetic characters.
+  const nonWsChars = raw.replace(/\s/g, '');
+  if (nonWsChars.length > 50) {
+    const letterCount = (nonWsChars.match(/[a-zA-Z]/g) || []).length;
+    const letterRatio = letterCount / nonWsChars.length;
+    if (letterRatio < 0.15) {
+      console.warn(
+        `[Offscreen] Wrong font encoding detected — only ` +
+        `${(letterRatio * 100).toFixed(1)}% alphabetic chars (expected >15%). ` +
+        `Flagging as isScanned.`
+      );
+      return { text: '', isScanned: true };
+    }
+  }
   
   const cleaned = cleanExtractedText(raw);
   
