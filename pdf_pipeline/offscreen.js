@@ -150,9 +150,33 @@ async function extractText(uint8Array) {
   
   const cleaned = cleanExtractedText(raw);
   
-  // Hybrid PDF Heuristic: If the average text per page is less than 500 characters,
-  // we assume the document is primarily a scanned image (with only a digital letterhead/footer)
-  if (cleaned.length < (500 * pdf.numPages)) {
+  // ── Hybrid PDF Heuristic ──────────────────────────────────────────────────
+  // Some PDFs mix a digital cover/letterhead with scanned body pages.
+  // We check two things:
+  //
+  //   1. Per-page check: if ANY single page has fewer than 500 characters
+  //      it is treated as a scanned/image page.  Even if other pages have
+  //      plenty of text, one blank/image page means the document is a hybrid
+  //      and the full PDF should be sent to NLM instead of a partial .txt.
+  //
+  //   2. Total check (fallback): if the entire document averages fewer than
+  //      500 characters per page, flag as scanned regardless.
+
+  const PAGE_MIN_CHARS = 500;
+
+  // Per-page check (on raw pages before cleaning, so spacing doesn't distort count)
+  const scannedPageIndex = rawPages.findIndex(p => p.trim().length < PAGE_MIN_CHARS);
+  if (scannedPageIndex !== -1) {
+    console.warn(
+      `[Offscreen] Page ${scannedPageIndex + 1} has only ` +
+      `${rawPages[scannedPageIndex].trim().length} chars (< ${PAGE_MIN_CHARS}) — ` +
+      `likely a scanned image page. Flagging whole document as isScanned.`
+    );
+    return { text: cleaned, isScanned: true };
+  }
+
+  // Total-length check (catches edge cases where all pages are sparse)
+  if (cleaned.length < (PAGE_MIN_CHARS * pdf.numPages)) {
     return { text: cleaned, isScanned: true };
   }
   
