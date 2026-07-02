@@ -48,6 +48,29 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
+// ── Update check on Ariba page load ───────────────────────────────────────────
+// In addition to the hourly alarm, run a check whenever the user opens or
+// navigates to an Ariba page.  This catches users who always keep the same
+// browser session open and rarely trigger the alarm naturally.
+//
+// Debounced to at most once per minute to stay well inside Chrome's
+// requestUpdateCheck throttle limit (roughly 1 call / 5 s).
+let _lastAribaUpdateCheck = 0;
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // Only fire when the Ariba page has fully loaded
+  if (changeInfo.status !== 'complete') return;
+  if (!tab.url || !tab.url.includes('.ariba.com')) return;
+
+  const now = Date.now();
+  if (now - _lastAribaUpdateCheck < 60_000) return; // debounce: once per minute
+  _lastAribaUpdateCheck = now;
+
+  chrome.runtime.requestUpdateCheck((status) => {
+    console.log(`[Ariba Ext] Update check (Ariba page load) → ${status}`);
+  });
+});
+
 // When Chrome has a new version ready, decide whether to reload immediately
 // or defer until the active job finishes.
 //
