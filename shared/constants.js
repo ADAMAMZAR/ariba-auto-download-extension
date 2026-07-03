@@ -29,7 +29,7 @@ var NLM_UPLOAD_BASE = 'https://notebooklm.google.com/upload/_/';
 
 // System instructions are fetched from this GitHub Gist so they can be
 // updated without releasing a new extension version.
-var GIST_URL = 'https://gist.githubusercontent.com/adamamzar15/a52b9242d6f8663f38595e1921ed540e/raw/system-instruction';
+var GIST_URL = 'https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1bedfe76caf59f3/raw/55743f21f93398e8c2c178db92536a48b63d3f31/system_instruction';
 
 // ── iLovePDF OCR API (disabled — uncomment to enable) ──────────────────────
 // Used ONLY for PDFs where pdf.js extraction returns isScanned: true
