@@ -15,7 +15,7 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   chrome.runtime.getURL('pdf_pipeline/pdf.worker.min.js');
 
-// ─── Cleaning pipeline (same 5 steps as pdf_text_extractor.py) ───────────────
+// ─── Cleaning pipeline (5 deterministic steps) ────────────────────────────────
 
 function _normalizeUnicodeWhitespace(text) {
   return text.replace(/[\u00a0\u2000-\u200b\u202f\u205f\u3000]/g, ' ');

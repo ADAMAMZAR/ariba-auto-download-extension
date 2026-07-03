@@ -8,13 +8,6 @@ try {
 } catch (e) {
   console.warn('[Ariba Ext] pdf_extractor.js failed to load — PDF→TXT disabled:', e?.message ?? e);
 }
-// ── iLovePDF OCR (disabled — uncomment to enable) ───────────────────────────
-// try {
-//   importScripts('../pdf_pipeline/ilovepdf_ocr.js');
-// } catch (e) {
-//   console.warn('[Ariba Ext] ilovepdf_ocr.js failed to load — OCR fallback disabled:', e?.message ?? e);
-// }
-
 // ─── Telemetry safety net ─────────────────────────────────────────────────────
 // Catches anything that slips past every explicit try/catch below — a bug in
 // code we haven't wrapped yet, a rejected promise nobody awaited, etc. Without
@@ -916,66 +909,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       });
                     }
 
-                    // ── iLovePDF OCR (disabled — uncomment block below to enable) ────────
-                    // When enabled: OCRs the PDF via iLovePDF API, re-extracts text,
-                    // saves .txt to disk and sends .txt to NLM instead of raw PDF.
-                    // Requires: ilovepdf_ocr.js importScripts (top of file) + manifest
-                    // host_permissions for api.ilovepdf.com + *.ilovepdf.com.
-                    //
-                    // notifyAribaTab(tabId,
-                    //   `"${realFilename}" has no readable text — running OCR via iLovePDF...`);
-                    // notifyPanel(`Running OCR on "${realFilename}"...`);
-                    // try {
-                    //   if (typeof ocrPdfWithIlovePdf !== 'function') {
-                    //     throw new Error('iLovePDF OCR module not loaded.');
-                    //   }
-                    //   const ocrBlob     = await ocrPdfWithIlovePdf(blob, realFilename);
-                    //   const ocrArrayBuf = await ocrBlob.arrayBuffer();
-                    //   const { text: ocrText, isScanned: stillScanned } =
-                    //     await extractTextFromPdfBuffer(ocrArrayBuf);
-                    //   if (stillScanned || !ocrText.trim()) {
-                    //     throw new Error('OCR produced no readable text.');
-                    //   }
-                    //   const txtFilename     = realFilename.replace(/\.pdf$/i, '.txt');
-                    //   const txtDataUrl      = textToDataUrl(ocrText);
-                    //   const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
-                    //   notifyAribaTab(tabId, `OCR complete for "${realFilename}" — saving as TXT.`);
-                    //   const ocrTxtDownloadId = await new Promise((resolve) => {
-                    //     chrome.downloads.download(
-                    //       { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
-                    //       (dlId) => {
-                    //         if (chrome.runtime.lastError || dlId === undefined) {
-                    //           notifyAribaTab(tabId, `OCR TXT save failed for "${txtFilename}"`, true);
-                    //           resolve(null);
-                    //         } else {
-                    //           notifyAribaTab(tabId, `Saved OCR TXT → ${destTxtFilename}`);
-                    //           resolve(dlId);
-                    //         }
-                    //       }
-                    //     );
-                    //   });
-                    //   if (ocrTxtDownloadId != null) diskDownloadIds.push(ocrTxtDownloadId);
-                    //   if (nlmEnabled) {
-                    //     filesForNotebook.push({
-                    //       filename: `${s} - ${cleanName(txtFilename)}`,
-                    //       dataUrl:  txtDataUrl,
-                    //       mimeType: 'text/plain'
-                    //     });
-                    //   }
-                    // } catch (ocrErr) {
-                    //   notifyAribaTab(tabId,
-                    //     `OCR failed for "${realFilename}" (${ocrErr.message}). ` +
-                    //     `Uploading original PDF to NotebookLM as fallback.`, true);
-                    //   notifyPanel(`OCR failed for "${realFilename}" — using original PDF.`, true);
-                    //   if (nlmEnabled) {
-                    //     dataUrl = await blobToDataUrl(blob);
-                    //     filesForNotebook.push({
-                    //       filename: `${s} - ${cleanName(realFilename)}`,
-                    //       dataUrl,
-                    //       mimeType
-                    //     });
-                    //   }
-                    // }
                   }
 
                 } catch (pdfErr) {

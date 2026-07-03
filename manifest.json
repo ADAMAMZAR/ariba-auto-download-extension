@@ -74,7 +74,6 @@
     {
       "resources": [
         "pdf_pipeline/pdf_extractor.js",
-        "pdf_pipeline/ilovepdf_ocr.js",
         "pdf_pipeline/offscreen.html",
         "pdf_pipeline/offscreen.js",
         "pdf_pipeline/pdf.min.js",
