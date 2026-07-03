@@ -280,6 +280,20 @@ async function blobToDataUrl(blob) {
   return `data:${blob.type};base64,${base64}`;
 }
 
+// Extension service workers don't support URL.createObjectURL, so disk-save
+// has no choice but to go through blobToDataUrl's base64 data: URL. That's
+// fine for one file at a time, but the DOWNLOAD_CONCURRENCY=4 worker pool
+// would otherwise let up to 4 files hold their base64-inflated copy in
+// memory simultaneously. This lock caps that to one file at a time — fetch
+// and PDF extraction still run at full concurrency, only the memory-heavy
+// encode+disk-save step is serialized.
+let _diskSaveLock = Promise.resolve();
+function withDiskSaveLock(fn) {
+  const run = _diskSaveLock.then(fn, fn);
+  _diskSaveLock = run.then(() => {}, () => {});
+  return run;
+}
+
 // -----------------------------------------------------------------------
 // Content hashing + cross-run PDF extraction cache
 //
@@ -896,29 +910,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             // ── Save to disk using the CORRECTED filename ──
             // Reuse the blob already fetched above instead of hitting file.url again —
             // avoids downloading every attachment twice (fetch() + chrome.downloads).
-            // Guarded in its own try/catch so a failure here (e.g. blobToDataUrl choking
-            // on an oversized file) only skips this one file instead of throwing out of
-            // processFile and aborting the whole batch via firstFatalError.
+            // The base64 encode + download-kickoff runs inside withDiskSaveLock so
+            // only one file's base64-inflated copy exists in memory at a time, even
+            // though up to DOWNLOAD_CONCURRENCY files are fetching/extracting in
+            // parallel. Guarded in its own try/catch so a failure here only skips
+            // this one file instead of throwing out of processFile and aborting the
+            // whole batch via firstFatalError.
             try {
-              const rawDataUrl = await blobToDataUrl(blob);
-              await new Promise((resolve) => {
-                const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(realFilename)}`;
-                chrome.downloads.download({ url: rawDataUrl, filename: destFilename, saveAs: false }, (downloadId) => {
-                  if (chrome.runtime.lastError || downloadId === undefined) {
-                    notifyAribaTab(tabId, `Disk download failed: ${realFilename}`, true);
-                    resolve();
-                    return;
-                  }
-                  diskDownloadIds.push(downloadId);
-                  const onChanged = (delta) => {
-                    if (delta.id !== downloadId) return;
-                    if (delta.state?.current === 'interrupted' || delta.state?.current === 'complete') {
-                      chrome.downloads.onChanged.removeListener(onChanged);
+              await withDiskSaveLock(async () => {
+                const rawDataUrl = await blobToDataUrl(blob);
+                await new Promise((resolve) => {
+                  const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(realFilename)}`;
+                  chrome.downloads.download({ url: rawDataUrl, filename: destFilename, saveAs: false }, (downloadId) => {
+                    if (chrome.runtime.lastError || downloadId === undefined) {
+                      notifyAribaTab(tabId, `Disk download failed: ${realFilename}`, true);
+                      resolve();
+                      return;
                     }
-                  };
-                  chrome.downloads.onChanged.addListener(onChanged);
-                  setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 300_000);
-                  resolve();
+                    diskDownloadIds.push(downloadId);
+                    const onChanged = (delta) => {
+                      if (delta.id !== downloadId) return;
+                      if (delta.state?.current === 'interrupted' || delta.state?.current === 'complete') {
+                        chrome.downloads.onChanged.removeListener(onChanged);
+                      }
+                    };
+                    chrome.downloads.onChanged.addListener(onChanged);
+                    setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 300_000);
+                    resolve();
+                  });
                 });
               });
             } catch (err) {
