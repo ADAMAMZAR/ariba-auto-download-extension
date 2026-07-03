@@ -9,8 +9,30 @@
 // ============================================================
 
 let authToken = '';
-let sourceCountCache = {}; // { notebookId: boolean } — true if notebook has at least 1 source
 let sourceCheckTimer = null;
+
+// Full source-list cache, keyed by notebookId: { sources: [{id,title}], timestamp }
+// Populated by fetchSources() and reused by every modal (Manage/Rename/Label) so
+// opening them back-to-back doesn't re-hit the Google RPC each time.
+let sourceListCache = {};
+const SOURCE_CACHE_TTL_MS = 30000; // safety net in case an invalidation event is ever missed
+
+// Returns the source list for notebookId, using the cache when it's still fresh.
+// Pass forceRefresh to bypass the cache (e.g. right after a mutation we can't
+// otherwise detect).
+async function getSources(notebookId, forceRefresh = false) {
+  const cached = sourceListCache[notebookId];
+  if (!forceRefresh && cached && (Date.now() - cached.timestamp) < SOURCE_CACHE_TTL_MS) {
+    return cached.sources;
+  }
+  const sources = await fetchSources(notebookId);
+  sourceListCache[notebookId] = { sources, timestamp: Date.now() };
+  return sources;
+}
+
+function invalidateSourceCache(notebookId) {
+  delete sourceListCache[notebookId];
+}
 
 // Tracks whether a mandatory sync is pending (gist changed since last sync)
 let syncPending = false;
@@ -157,7 +179,7 @@ window.addEventListener('message', (event) => {
   if (event.data.type === 'NOTEBOOKLM_SOURCES_UPDATED') {
     const nbId = getNotebookId();
     if (nbId) {
-      delete sourceCountCache[nbId]; // Always invalidate — source list just changed
+      invalidateSourceCache(nbId); // Always invalidate — source list just changed
       scheduleSourceCheck(nbId);
     }
   }
@@ -224,6 +246,7 @@ async function fetchSources(notebookId) {
   const text = await response.text();
 
   const sourceObjects = [];
+  const seenIds = new Set();
   try {
     // batchexecute returns string starting with )]}' 
     const cleanText = text.replace(/^\)\]\}'\s*/, '');
@@ -276,7 +299,8 @@ async function fetchSources(notebookId) {
 
               const title = typeof sourceData[1] === 'string' ? sourceData[1] : 'Untitled';
 
-              if (!sourceObjects.find(s => s.id === sourceId)) {
+              if (!seenIds.has(sourceId)) {
+                seenIds.add(sourceId);
                 sourceObjects.push({ id: sourceId, title });
               }
             }
@@ -322,6 +346,27 @@ async function deleteSource(notebookId, sourceId) {
   if (!response.ok) {
     throw new Error(`Failed to delete source ${sourceId}`);
   }
+}
+
+// Deletes `ids` in parallel chunks, reporting progress after each chunk via
+// onProgress(done, total). Uses allSettled (not Promise.all) so one failing
+// source doesn't abort the chunks after it — every id gets attempted, and we
+// come back with exactly which ones succeeded vs failed.
+async function deleteSourcesWithProgress(notebookId, ids, onProgress) {
+  const chunkSize = 8;
+  const succeeded = [];
+  const failed = [];
+
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const results = await Promise.allSettled(chunk.map(id => deleteSource(notebookId, id)));
+    results.forEach((result, idx) => {
+      (result.status === 'fulfilled' ? succeeded : failed).push(chunk[idx]);
+    });
+    onProgress(succeeded.length + failed.length, ids.length);
+  }
+
+  return { succeeded, failed };
 }
 
 // Rename a single source
@@ -482,9 +527,9 @@ async function openManageModal() {
   footer.appendChild(cancelBtn);
   footer.appendChild(deleteBtn);
 
-  // Fetch sources
+  // Fetch sources (reuses the cache when fresh)
   try {
-    const sources = await fetchSources(notebookId);
+    const sources = await getSources(notebookId);
 
     if (sources.length === 0) {
       body.innerHTML = '<p>No sources found in this notebook.</p>';
@@ -601,21 +646,53 @@ async function openManageModal() {
 
       document.getElementById('nlm-confirm-delete').onclick = async () => {
         confirmOverlay.remove();
+        await runDelete(selectedIds);
+      };
+    }; // End of deleteBtn.onclick
 
-        deleteBtn.disabled = true;
-        cancelBtn.disabled = true;
-        Array.from(controls.querySelectorAll('button')).forEach(b => b.disabled = true);
+    // Maps a source id back to its title, for reporting failures by name
+    // instead of an opaque UUID.
+    const idToTitle = new Map(sources.map(s => [s.id, s.title]));
 
-        try {
-          const chunkSize = 5;
-          for (let i = 0; i < selectedIds.length; i += chunkSize) {
-            const chunk = selectedIds.slice(i, i + chunkSize);
-            await Promise.all(chunk.map(id => deleteSource(notebookId, id)));
-            deleteBtn.innerText = `Deleted ${Math.min(i + chunkSize, selectedIds.length)} / ${selectedIds.length}`;
-          }
+    // Runs the delete for `ids`, driving a visible progress bar the whole
+    // time, and ending on a success / partial-failure (with retry) / full
+    // failure state depending on what actually happened.
+    async function runDelete(ids) {
+      deleteBtn.disabled = true;
+      cancelBtn.disabled = true;
+      Array.from(controls.querySelectorAll('button')).forEach(b => b.disabled = true);
+      footer.style.display = 'none';
 
-          // Show success state in modal
-          body.innerHTML = `
+      body.innerHTML = `
+        <div class="nlm-progress-state">
+          <div class="nlm-spinner"></div>
+          <p class="nlm-progress-text">Deleting 0 of ${ids.length} source(s)…</p>
+          <div class="nlm-progress-bar-track">
+            <div class="nlm-progress-bar-fill" style="width: 0%"></div>
+          </div>
+        </div>
+      `;
+      const progressText = body.querySelector('.nlm-progress-text');
+      const progressFill = body.querySelector('.nlm-progress-bar-fill');
+
+      const { succeeded, failed } = await deleteSourcesWithProgress(notebookId, ids, (done, total) => {
+        progressText.textContent = `Deleting ${done} of ${total} source(s)…`;
+        progressFill.style.width = `${Math.round((done / total) * 100)}%`;
+      });
+
+      body.style.borderBottom = 'none';
+      body.style.paddingBottom = '0px';
+
+      if (succeeded.length > 0) {
+        // Even on a partial failure, some deletions went through — invalidate
+        // so the next open reflects reality instead of showing stale sources.
+        invalidateSourceCache(notebookId);
+        const remainingCount = sources.length - succeeded.length;
+        updateKitButtonStates(remainingCount > 0);
+      }
+
+      if (failed.length === 0) {
+        body.innerHTML = `
           <div class="nlm-success-state">
             <div class="nlm-success-icon">
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
@@ -623,48 +700,49 @@ async function openManageModal() {
               </svg>
             </div>
             <h3>Success</h3>
-            <p>Successfully deleted ${selectedIds.length} source(s).</p>
+            <p>Successfully deleted ${succeeded.length} source(s).</p>
           </div>
         `;
+        setTimeout(() => overlay.remove(), 2000);
+        return;
+      }
 
-          footer.style.display = 'none';
-          body.style.borderBottom = 'none';
-          body.style.paddingBottom = '0px';
-
-          // Update toolbar button states: if all sources were deleted, disable the buttons
-          const remainingCount = sources.length - selectedIds.length;
-          sourceCountCache[notebookId] = remainingCount > 0;
-          updateKitButtonStates(remainingCount > 0);
-
-          setTimeout(() => {
-            overlay.remove();
-          }, 2000);
-
-        } catch (err) {
-          console.error('Delete error:', err);
-
-          body.innerHTML = `
-          <div class="nlm-success-state">
-            <div class="nlm-success-icon" style="color: var(--nlm-danger); background: rgba(217, 48, 37, 0.1);">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="18" y1="6" x2="6" y2="18"></line>
-                <line x1="6" y1="6" x2="18" y2="18"></line>
-              </svg>
-            </div>
-            <h3>Error Deleting Sources</h3>
-            <p>${err.message}</p>
+      // Partial or total failure — tell the user exactly what didn't make it
+      // through, and let them retry just the failed ones instead of redoing
+      // the whole batch.
+      const failedTitles = failed.map(id => idToTitle.get(id) || id);
+      body.innerHTML = `
+        <div class="nlm-success-state">
+          <div class="nlm-success-icon" style="color: var(--nlm-danger); background: rgba(217, 48, 37, 0.1);">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
           </div>
-        `;
+          <h3>${succeeded.length > 0 ? 'Partially Deleted' : 'Delete Failed'}</h3>
+          <p>
+            ${succeeded.length > 0 ? `Deleted ${succeeded.length} of ${ids.length} source(s). ` : ''}
+            ${failed.length} failed:
+          </p>
+          <ul class="nlm-failed-list">
+            ${failedTitles.map(t => `<li>${t}</li>`).join('')}
+          </ul>
+        </div>
+      `;
 
-          footer.innerHTML = '';
-          const closeBtn = document.createElement('button');
-          closeBtn.className = 'nlm-btn nlm-btn-secondary';
-          closeBtn.innerText = 'Close';
-          closeBtn.onclick = () => overlay.remove();
-          footer.appendChild(closeBtn);
-        }
-      }; // End of inner confirm
-    }; // End of deleteBtn.onclick
+      footer.style.display = 'flex';
+      footer.innerHTML = '';
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'nlm-btn nlm-btn-secondary';
+      closeBtn.innerText = 'Close';
+      closeBtn.onclick = () => overlay.remove();
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'nlm-btn nlm-btn-danger';
+      retryBtn.innerText = `Retry ${failed.length} Failed`;
+      retryBtn.onclick = () => runDelete(failed);
+      footer.appendChild(closeBtn);
+      footer.appendChild(retryBtn);
+    }
 
   } catch (error) {
     console.error('Fetch error:', error);
@@ -689,21 +767,16 @@ function updateKitButtonStates(hasSource) {
 function scheduleSourceCheck(notebookId) {
   if (sourceCheckTimer) clearTimeout(sourceCheckTimer);
   sourceCheckTimer = setTimeout(async () => {
-    // Return cached result instantly to avoid redundant API calls
-    if (notebookId in sourceCountCache) {
-      updateKitButtonStates(sourceCountCache[notebookId]);
-      return;
-    }
     // Token may not be ready yet on first paint — retry after another 800ms
     if (!authToken) {
       scheduleSourceCheck(notebookId);
       return;
     }
     try {
-      const sources = await fetchSources(notebookId);
-      const hasSources = sources.length > 0;
-      sourceCountCache[notebookId] = hasSources;
-      updateKitButtonStates(hasSources);
+      // Uses the cache when fresh, otherwise fetches — either way this also
+      // warms sourceListCache so opening a modal right after is instant.
+      const sources = await getSources(notebookId);
+      updateKitButtonStates(sources.length > 0);
     } catch (e) {
       // On API error, enable buttons so user isn't blocked
       updateKitButtonStates(true);
@@ -961,9 +1034,9 @@ async function openRenameModal() {
   footer.appendChild(cancelBtn);
   footer.appendChild(renameBtn);
 
-  // Fetch sources
+  // Fetch sources (reuses the cache when fresh)
   try {
-    const sources = await fetchSources(notebookId);
+    const sources = await getSources(notebookId);
 
     if (sources.length === 0) {
       body.innerHTML = '<p>No sources found in this notebook.</p>';
@@ -1102,6 +1175,9 @@ async function openRenameModal() {
           }));
           renameBtn.innerText = `Renamed ${Math.min(i + chunkSize, selectedItems.length)} / ${selectedItems.length}`;
         }
+
+        // Titles changed — invalidate so the next open picks up the new names.
+        invalidateSourceCache(notebookId);
 
         // Show success state in modal
         body.innerHTML = `
@@ -1310,7 +1386,7 @@ async function fetchLabels(notebookId) {
   const sourceToLabelMap = {};
 
   // We must fetch sources first to know which UUIDs are Source IDs vs Label IDs
-  const sources = await fetchSources(notebookId);
+  const sources = await getSources(notebookId);
   const sourceIds = new Set(sources.map(s => s.id));
 
   try {
