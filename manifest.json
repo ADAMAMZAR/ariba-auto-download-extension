@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GPO - Automatic Certificate Checker",
-  "version": "2.6.4",
+  "version": "2.6.5",
   "description": "Automatically expands and downloads attachments from Ariba, saving them in supplier-named folders.",
   "permissions": [
     "scripting",

@@ -281,6 +281,44 @@ async function blobToDataUrl(blob) {
 }
 
 // -----------------------------------------------------------------------
+// Content hashing + cross-run PDF extraction cache
+//
+// Used to (a) skip byte-identical duplicate files within a single run — the
+// same boilerplate cert commonly gets attached under different filenames —
+// and (b) avoid re-parsing a PDF whose text we've already extracted in a
+// previous run, since that recurring cert reappears often.
+// -----------------------------------------------------------------------
+
+async function hashArrayBuffer(buffer) {
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+const PDF_TEXT_CACHE_PREFIX = 'pdfTextCache_';
+
+async function getCachedPdfText(hash) {
+  try {
+    const key = PDF_TEXT_CACHE_PREFIX + hash;
+    const stored = await chrome.storage.local.get(key);
+    return stored[key] ?? null;
+  } catch (e) {
+    return null; // a cache read failure should never break extraction
+  }
+}
+
+async function setCachedPdfText(hash, record) {
+  try {
+    const key = PDF_TEXT_CACHE_PREFIX + hash;
+    await chrome.storage.local.set({ [key]: record });
+  } catch (e) {
+    // Quota exceeded or similar — just skip caching this result.
+    console.warn('[Ariba Ext] Failed to cache PDF extraction result:', e?.message ?? e);
+  }
+}
+
+// -----------------------------------------------------------------------
 // Fetch helpers — timeout + retry
 // -----------------------------------------------------------------------
 
@@ -589,18 +627,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
           const nlmEnabled = notebooklmConfig?.connectToNotebooklm === true;
 
-          // ── Process files sequentially: Fetch → Extract Name → Disk + NLM ──
+          // ── Process files with bounded concurrency: Fetch → Extract → Disk + NLM ──
+          // Files are independent, so several can be in flight at once instead of each
+          // one's fetch + extraction + disk-save fully finishing before the next starts.
+          // The dedup checks below (seenHashes / usedFilenames) are plain synchronous
+          // JS with no `await` between check-and-set, so concurrent workers can't race
+          // on them — JS never interleaves in the middle of a synchronous block.
+          const DOWNLOAD_CONCURRENCY = 4;
           const files = request.files || [];
           const diskDownloadIds = [];
           const filesForNotebook = [];
           const usedFilenames = new Set(); // Track filenames to guarantee uniqueness
+          const seenHashes = new Map(); // hash -> filename, to skip byte-identical duplicate files this run
 
-          for (let idx = 0; idx < files.length; idx++) {
+          async function processFile(idx) {
             if (stopSignal.aborted) throw new Error('Stopped by user.');
             const file = files[idx];
             let realFilename = file.filename.replace(/["']/g, '').trim();
             let mimeType = '';
             let dataUrl = null;
+            let blob = null;
 
             notifyAribaTab(tabId, `Fetching file ${idx + 1}/${files.length}: ${realFilename}...`);
 
@@ -632,8 +678,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 }
               }
 
-              const blob = await resp.blob();
+              blob = await resp.blob();
               mimeType = blob.type || resp.headers.get('Content-Type') || '';
+
+              // 1b. Content-hash dedup: skip files that are byte-for-byte identical to
+              // one already processed this run (Ariba sometimes serves the exact same
+              // document under two different filenames/attachment slots).
+              const arrayBuf = await blob.arrayBuffer();
+              const fileHash = await hashArrayBuffer(arrayBuf);
+              if (seenHashes.has(fileHash)) {
+                notifyAribaTab(tabId,
+                  `Skipped "${realFilename}" — identical to "${seenHashes.get(fileHash)}" (already processed).`);
+                return;
+              }
+              seenHashes.set(fileHash, realFilename);
 
               // 2. Fallback: if filename STILL doesn't have an extension, guess from the mime type
               if (!realFilename.includes('.')) {
@@ -670,14 +728,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               if (isPdf && typeof extractTextFromPdfBuffer === 'function') {
                 notifyAribaTab(tabId, `Extracting text from "${realFilename}"...`);
                 try {
-                  const arrayBuf = await blob.arrayBuffer();
-                  const { text, isScanned, isPasswordProtected } = await extractTextFromPdfBuffer(arrayBuf);
+                  // Reuse a prior run's extraction for this exact file if we've seen it
+                  // before — skips re-parsing the PDF entirely.
+                  const cachedExtraction = await getCachedPdfText(fileHash);
+                  let text, isScanned, isPasswordProtected;
+                  if (cachedExtraction) {
+                    ({ text, isScanned, isPasswordProtected } = cachedExtraction);
+                    notifyAribaTab(tabId, `Using cached extraction for "${realFilename}" (seen before).`);
+                  } else {
+                    ({ text, isScanned, isPasswordProtected } = await extractTextFromPdfBuffer(arrayBuf));
+                  }
 
                   if (isPasswordProtected) {
                     notifyAribaTab(tabId, `Skipped uploading "${realFilename}" to NotebookLM (password protected).`, true);
                     notifyPanel(`Skipped NotebookLM upload for "${realFilename}" (password protected).`, true);
                   } else if (!isScanned) {
                     // ── Scanned OK: save .txt to disk + send .txt to NLM ────
+                    if (!cachedExtraction) await setCachedPdfText(fileHash, { text, isScanned: false, isPasswordProtected: false });
                     const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
                     const txtDataUrl = textToDataUrl(text);
 
@@ -814,13 +881,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             } catch (err) {
               if (err.message === 'Stopped by user.') throw err;
               notifyAribaTab(tabId, `Failed to fetch "${realFilename}" after retries: ${err.message}`, true);
-              continue; // Skip this file and move to the next
+              return; // Skip this file
             }
 
             // ── Save to disk using the CORRECTED filename ──
+            // Reuse the blob already fetched above instead of hitting file.url again —
+            // avoids downloading every attachment twice (fetch() + chrome.downloads).
+            const rawDataUrl = await blobToDataUrl(blob);
             await new Promise((resolve) => {
               const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(realFilename)}`;
-              chrome.downloads.download({ url: file.url, filename: destFilename, saveAs: false }, (downloadId) => {
+              chrome.downloads.download({ url: rawDataUrl, filename: destFilename, saveAs: false }, (downloadId) => {
                 if (chrome.runtime.lastError || downloadId === undefined) {
                   notifyAribaTab(tabId, `Disk download failed: ${realFilename}`, true);
                   resolve();
@@ -839,6 +909,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               });
             });
           }
+
+          // Run processFile with bounded concurrency instead of one file at a time.
+          let nextFileIdx = 0;
+          let firstFatalError = null;
+          async function fileWorker() {
+            while (nextFileIdx < files.length) {
+              if (firstFatalError) return;
+              const idx = nextFileIdx++;
+              try {
+                await processFile(idx);
+              } catch (err) {
+                firstFatalError = firstFatalError || err;
+                return;
+              }
+            }
+          }
+          await Promise.all(
+            Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, files.length) }, fileWorker)
+          );
+          if (firstFatalError) throw firstFatalError;
 
           if (stopSignal.aborted) throw new Error('Stopped by user.');
 
