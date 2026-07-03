@@ -11,6 +11,19 @@
 let authToken = '';
 let sourceCheckTimer = null;
 
+// Relays NotebookLM-side failures to background.js's telemetry ring buffer —
+// otherwise these only ever reach whichever colleague's own DevTools console.
+function reportNlmError(context, err) {
+  chrome.runtime.sendMessage({
+    action: 'reportError',
+    source: 'notebooklm_kit.js',
+    context,
+    message: err?.message ?? String(err),
+    stack: err?.stack,
+    url: location.href,
+  }).catch(() => { });
+}
+
 // Full source-list cache, keyed by notebookId: { sources: [{id,title}], timestamp }
 // Populated by fetchSources() and reused by every modal (Manage/Rename/Label) so
 // opening them back-to-back doesn't re-hit the Google RPC each time.
@@ -119,6 +132,7 @@ async function checkGistForChanges() {
     }
   } catch (e) {
     console.error('[NLM Kit] Error in checkGistForChanges:', e);
+    reportNlmError('checkGistForChanges', e);
     // Network failure — don't block the user
   }
 }
@@ -746,6 +760,7 @@ async function openManageModal() {
 
   } catch (error) {
     console.error('Fetch error:', error);
+    reportNlmError('bulkDeleteSources', error);
     body.innerHTML = `<p style="color: red;">Failed to load sources: ${error.message}</p>`;
   }
 }
@@ -1202,6 +1217,7 @@ async function openRenameModal() {
 
       } catch (err) {
         console.error('Rename error:', err);
+        reportNlmError('renameSources', err);
 
         body.innerHTML = `
           <div class="nlm-success-state">
@@ -1227,6 +1243,7 @@ async function openRenameModal() {
 
   } catch (error) {
     console.error('Fetch error:', error);
+    reportNlmError('renameSourcesModal', error);
     body.innerHTML = `<p style="color: red;">Failed to load sources: ${error.message}</p>`;
   }
 }
@@ -1350,6 +1367,7 @@ async function syncInstructions() {
 
   } catch (err) {
     console.error(err);
+    reportNlmError('syncSystemInstructions', err);
     statusMsg.innerText = `Error: ${err.message}`;
     statusMsg.style.color = '#d93025';
 
@@ -1740,6 +1758,7 @@ async function openLabelModal() {
             successCount++;
           } catch (e) {
             console.error(e);
+            reportNlmError('labelAssignment', e);
           }
         }
       }
@@ -1758,6 +1777,7 @@ async function openLabelModal() {
 
   } catch (error) {
     console.error('Fetch error:', error);
+    reportNlmError('labelModal', error);
     body.innerHTML = `<p style="color: red;">Failed to load data: ${error.message}</p>`;
   }
 }

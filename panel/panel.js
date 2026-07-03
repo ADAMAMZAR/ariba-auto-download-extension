@@ -93,6 +93,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     } catch (err) {
       addLog('Error: ' + err.message, 'error');
+      chrome.runtime.sendMessage({
+        action: 'reportError',
+        source: 'panel.js',
+        context: 'downloadBtn click',
+        message: err.message,
+        stack: err.stack,
+      }).catch(() => { });
       setRunning(false);
     }
   });
@@ -102,6 +109,36 @@ document.addEventListener('DOMContentLoaded', () => {
     addLog('Stop requested by user.', 'info');
     chrome.runtime.sendMessage({ action: 'stopAutomation' });
     stopBtn.disabled = true;
+  });
+
+  // Report a problem — packages recent activity + an optional note and
+  // sends it off so issues can be diagnosed without needing screen-share
+  // access to whoever hit the bug.
+  const reportProblemBtn = document.getElementById('report-problem-btn');
+  const reportSupplierInput = document.getElementById('report-supplier');
+  const reportNoteInput = document.getElementById('report-note');
+  reportProblemBtn.addEventListener('click', async () => {
+    const note = reportNoteInput.value.trim();
+    const supplier = reportSupplierInput.value.trim();
+
+    reportProblemBtn.disabled = true;
+    const originalText = reportProblemBtn.textContent;
+    reportProblemBtn.textContent = 'Sending...';
+
+    try {
+      const result = await chrome.runtime.sendMessage({ action: 'reportProblem', note, supplier });
+      if (result?.ok) {
+        addLog('Problem report sent. Thanks!', 'done');
+        reportNoteInput.value = '';
+      } else {
+        addLog('Report saved locally (send failed: ' + (result?.error || 'unknown error') + ').', 'error');
+      }
+    } catch (err) {
+      addLog('Failed to send report: ' + err.message, 'error');
+    } finally {
+      reportProblemBtn.disabled = false;
+      reportProblemBtn.textContent = originalText;
+    }
   });
 
 

@@ -46,3 +46,14 @@ var POPUP_HEIGHT = 520;
 
 // Max files processed in parallel during a NotebookLM upload batch
 var UPLOAD_BATCH_SIZE = 5;
+
+// ── Remote error telemetry ────────────────────────────────────────────
+// Google Apps Script Web App URL that receives error reports (see
+// telemetry/apps_script.gs + telemetry/SETUP.md for how to deploy one).
+// Leave blank to disable remote reporting — errors are still kept in the
+// local ring buffer (chrome.storage.local key TELEMETRY_LOG_KEY) either way.
+var TELEMETRY_ENDPOINT = 'https://script.google.com/a/macros/gamuda.com.my/s/AKfycby9k__kkKNqrdP2HoaIraPF0CFqzvns5odOGUOdk7tI9HdJUxr8898htQ6yA1bu4hiB/exec';
+
+// Local ring-buffer settings (chrome.storage.local)
+var TELEMETRY_LOG_KEY = 'debugLog';
+var TELEMETRY_LOG_MAX = 50;

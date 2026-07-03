@@ -36,6 +36,16 @@
       <div class="log-title">Activity Log</div>
       <div id="log-entries"></div>
     </div>
+
+    <div class="input-group">
+      <label for="report-supplier">Supplier name (for bug report)</label>
+      <input type="text" id="report-supplier" placeholder="e.g. Orbus3 Pty Ltd" />
+    </div>
+    <div class="input-group">
+      <label for="report-note">What went wrong? (optional)</label>
+      <textarea id="report-note" rows="3" placeholder="Recent activity is attached automatically."></textarea>
+    </div>
+    <button id="report-problem-btn" class="btn-secondary">🐞 Report a problem</button>
   </div>
   <script src="panel.js"></script>
 </body>

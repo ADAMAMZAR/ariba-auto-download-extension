@@ -122,22 +122,24 @@
     expansionButtons: expansionButtons.length
   });
 
+  // Hoisted above the try so the catch block (and error reports) can
+  // include which supplier was being processed when something failed.
+  let supplierName = 'Unknown Supplier';
+  let rawSupplierName = 'Unknown Supplier';
+  if (supplierElement) {
+    rawSupplierName = supplierElement.textContent.trim();
+    supplierName = rawSupplierName
+      .replace(/PTY LIMITED/gi, 'P/L')
+      .replace(/PTY LTD\.?/gi, 'P/L')
+      .replace(/The trustee of\s+/gi, 'TOF ')
+      .replace(/The trustee for\s+/gi, 'TOF ')
+      .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem chars
+      .replace(/\.+$/, '')              // Windows: no trailing periods
+      .trim();
+  }
+
   try {
     showToast('Found Ariba content. Processing...');
-
-    let supplierName = 'Unknown Supplier';
-    let rawSupplierName = 'Unknown Supplier';
-    if (supplierElement) {
-      rawSupplierName = supplierElement.textContent.trim();
-      supplierName = rawSupplierName
-        .replace(/PTY LIMITED/gi, 'P/L')
-        .replace(/PTY LTD\.?/gi, 'P/L')
-        .replace(/The trustee of\s+/gi, 'TOF ')
-        .replace(/The trustee for\s+/gi, 'TOF ')
-        .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem chars
-        .replace(/\.+$/, '')              // Windows: no trailing periods
-        .trim();
-    }
 
     let workspaceTitle = 'Questionnaire';
     const titleElement = document.getElementById('workspace-title');
@@ -277,6 +279,14 @@
     if (err.message !== 'Stopped by user.') {
       showToast('Error: ' + err.message, true);
       console.error('[Ariba Ext] Error running automation:', err);
+      chrome.runtime.sendMessage({
+        action: 'reportError',
+        source: 'content.js',
+        message: err.message,
+        stack: err.stack,
+        url: location.href,
+        supplier: rawSupplierName,
+      }).catch(() => { });
     }
   } finally {
     window.__aribaStop = false;

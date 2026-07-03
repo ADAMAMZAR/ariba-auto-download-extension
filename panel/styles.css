@@ -119,16 +119,20 @@ button:disabled {
   color: #5f6368;
 }
 
-.input-group input {
+.input-group input,
+.input-group textarea {
   padding: 8px;
   border: 1px solid #dadce0;
   border-radius: 4px;
   font-size: 13px;
   outline: none;
   transition: border-color 0.2s;
+  font-family: inherit;
+  resize: vertical;
 }
 
-.input-group input:focus {
+.input-group input:focus,
+.input-group textarea:focus {
   border-color: #1a73e8;
 }
 

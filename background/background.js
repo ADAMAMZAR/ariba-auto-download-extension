@@ -15,6 +15,28 @@ try {
 //   console.warn('[Ariba Ext] ilovepdf_ocr.js failed to load — OCR fallback disabled:', e?.message ?? e);
 // }
 
+// ─── Telemetry safety net ─────────────────────────────────────────────────────
+// Catches anything that slips past every explicit try/catch below — a bug in
+// code we haven't wrapped yet, a rejected promise nobody awaited, etc. Without
+// this, those failures are invisible: MV3 service workers have no visible
+// console for colleagues to check, so an uncaught error just silently kills
+// whatever was running.
+self.addEventListener('error', (event) => {
+  reportEvent('fatal', {
+    context: 'unhandled-error',
+    message: event.message,
+    stack: event.error?.stack,
+  });
+});
+
+self.addEventListener('unhandledrejection', (event) => {
+  reportEvent('fatal', {
+    context: 'unhandled-rejection',
+    message: event.reason?.message ?? String(event.reason),
+    stack: event.reason?.stack,
+  });
+});
+
 // ─── Auto-Update ──────────────────────────────────────────────────────────────
 // Chrome auto-updates extensions from the Web Store, but only applies the
 // update when all extension tabs are closed or the browser restarts.
@@ -245,17 +267,57 @@ function notifyAribaTab(tabId, text, isError = false) {
   if (tabId) {
     chrome.tabs.sendMessage(tabId, { action: 'showToast', text, isError }).catch(() => { });
   }
+  if (isError) reportEvent('error', { message: text, supplier: _currentReportSupplier });
 }
 
 function notifyPanel(text, error = false, done = false) {
   chrome.runtime.sendMessage({ type: 'status', text, error, done }).catch(() => { });
 }
 
+// -----------------------------------------------------------------------
+// Remote error telemetry
+//
+// Manual repro across ~20 users on different machines/networks doesn't
+// scale — this keeps a local ring buffer of recent events (for the
+// "Report a problem" button in the popup) and, when TELEMETRY_ENDPOINT is
+// configured, also fires each error at a remote sink automatically so
+// failures surface without anyone needing to describe them.
+// -----------------------------------------------------------------------
+async function reportEvent(type, details = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    type, // 'error' | 'fatal' | 'manual-report'
+    version: chrome.runtime.getManifest().version,
+    ua: (typeof navigator !== 'undefined' && navigator.userAgent) || '',
+    ...details,
+  };
+
+  try {
+    const { [TELEMETRY_LOG_KEY]: existing = [] } = await chrome.storage.local.get(TELEMETRY_LOG_KEY);
+    const updated = [...existing, entry].slice(-TELEMETRY_LOG_MAX);
+    await chrome.storage.local.set({ [TELEMETRY_LOG_KEY]: updated });
+  } catch (e) {
+    console.warn('[Ariba Ext] Failed to write local debug log:', e?.message ?? e);
+  }
+
+  if (type !== 'manual-report' && TELEMETRY_ENDPOINT) {
+    // Fire-and-forget — never let a reporting failure affect the user-facing flow.
+    fetch(TELEMETRY_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight to Apps Script
+      body: JSON.stringify(entry),
+    }).catch((e) => console.warn('[Ariba Ext] Telemetry send failed:', e?.message ?? e));
+  }
+
+  return entry;
+}
+
 function cleanName(n) {
   return n
     .replace(/["']/g, '')              // Strip quotes completely instead of making them dashes
     .replace(/PTY LIMITED/gi, 'P/L')
-    .replace(/PTY LTD\.?/gi, 'P/L')
+    .replace(/PTY LTD\.(?!pdf|docx?|xlsx?|txt|jpe?g|png)/gi, 'P/L')
+    .replace(/PTY LTD/gi, 'P/L')
     .replace(/The trustee of\s+/gi, 'TOF ')
     .replace(/The trustee for\s+/gi, 'TOF ')
     .replace(/[\/\\?%*:|<>]/g, '-')    // Replace illegal filesystem characters with dashes
@@ -543,6 +605,7 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
 // -----------------------------------------------------------------------
 let _stopController = null;   // AbortController for the active run
 let _activeAribaTabId = null; // Ariba tab that initiated the run
+let _currentReportSupplier = null; // supplier name of the active run, for error telemetry
 
 function triggerStop() {
   // 1. Abort all in-flight fetches
@@ -560,6 +623,7 @@ function triggerStop() {
 function clearStopSignal() {
   _stopController = null;
   _activeAribaTabId = null;
+  _currentReportSupplier = null;
 }
 
 // -----------------------------------------------------------------------
@@ -584,6 +648,49 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.action === 'stopAutomation') {
       triggerStop(); // aborts fetches + messages the Ariba tab directly
+      return;
+    }
+
+    // ── Errors relayed from content scripts (content.js, notebooklm_kit.js) ──
+    // These run on the page itself and previously only reached whichever
+    // colleague's own DevTools console via console.error.
+    if (request.action === 'reportError') {
+      await reportEvent('error', {
+        source: request.source,
+        context: request.context,
+        message: request.message,
+        stack: request.stack,
+        pageUrl: request.url,
+        supplier: request.supplier,
+      });
+      return;
+    }
+
+    // ── Manual "Report a problem" button in the popup ──────────────────────
+    // Packages the local ring buffer (recent errors + activity) plus an
+    // optional user note and force-sends it to TELEMETRY_ENDPOINT, even for
+    // non-crashing weirdness that never hit a catch block.
+    if (request.action === 'reportProblem') {
+      try {
+        const { [TELEMETRY_LOG_KEY]: recentEvents = [] } = await chrome.storage.local.get(TELEMETRY_LOG_KEY);
+        const entry = await reportEvent('manual-report', {
+          note: request.note || '',
+          supplier: request.supplier || '',
+          recentEvents,
+        });
+        if (!TELEMETRY_ENDPOINT) {
+          sendResponse({ ok: false, error: 'Telemetry endpoint not configured — report saved locally only.' });
+          return;
+        }
+        const resp = await fetch(TELEMETRY_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(entry),
+        });
+        sendResponse({ ok: resp.ok });
+      } catch (e) {
+        sendResponse({ ok: false, error: e?.message ?? String(e) });
+      }
       return;
     }
 
@@ -635,6 +742,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           const s = cleanName(request.supplierName || 'Ariba');
           supplierKey = s; // expose to outer catch
+          _currentReportSupplier = request.rawSupplierName || request.supplierName || s;
           const tabId = sender.tab?.id;
 
           // Check NotebookLM config FIRST — skip all fetch() work if NLM is disabled
@@ -1083,6 +1191,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const isStopped = err.message === 'Stopped by user.';
         notifyAribaTab(tabId, isStopped ? 'Download stopped by user.' : 'Error: ' + err.message, true);
         notifyPanel(isStopped ? 'Stopped by user.' : 'Error: ' + err.message, true, true);
+        if (!isStopped) {
+          // Awaited so the service worker isn't suspended mid-send (MV3 workers
+          // can be torn down the instant Chrome thinks there's no pending work,
+          // and an un-awaited fetch doesn't count as pending work to Chrome).
+          await reportEvent('fatal', { message: err.message, stack: err.stack, supplier: supplierKey });
+        }
         // Clear any stale session state so the next run starts clean
         if (supplierKey) clearState(supplierKey).catch(() => { });
       } finally {

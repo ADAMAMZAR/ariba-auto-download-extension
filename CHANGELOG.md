@@ -10,6 +10,23 @@ Version numbers follow [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [2.6.6] — 2026-07-03
+
+### Fixed
+- Filename sanitizer no longer swallows the file extension's dot when a
+  supplier name ends in "Pty Ltd" (e.g. `...Pty Ltd.pdf` was becoming
+  `...P-Lpdf` instead of `...P-L.pdf`).
+
+### Added
+- Remote error telemetry: download/upload failures across content.js,
+  notebooklm_kit.js, and background.js are now automatically reported (plus
+  a manual "🐞 Report a problem" button in the popup), so issues reported by
+  colleagues can be diagnosed without needing access to their machine.
+- Error reports now include the supplier name — automatically for errors
+  during a download run (read from the same `.supplier-name` element used
+  for the QA extraction), and as an editable field on the manual "Report a
+  problem" form.
+
 ## [2.1.0] — 2026-06-03
 
 ### Added
