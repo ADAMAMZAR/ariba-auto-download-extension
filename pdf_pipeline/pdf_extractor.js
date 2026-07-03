@@ -17,19 +17,37 @@
 
 const OFFSCREEN_URL = 'pdf_pipeline/offscreen.html';
 
-async function _ensureOffscreenDocument() {
-  // Check whether the offscreen document is already open
-  const existing = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)]
-  });
-  if (existing.length > 0) return;
+// Concurrent callers (multiple PDFs extracted in parallel) must not race to
+// create the offscreen document — Chrome allows only one per extension, and
+// a second createDocument() call while one is in flight throws. All callers
+// share this single in-flight promise instead of each doing their own
+// check-then-create.
+let _offscreenReadyPromise = null;
 
-  await chrome.offscreen.createDocument({
-    url: chrome.runtime.getURL(OFFSCREEN_URL),
-    reasons: ['BLOBS'],
-    justification: 'PDF text extraction with pdf.js (requires DOM and Worker API)'
-  });
+async function _ensureOffscreenDocument() {
+  if (_offscreenReadyPromise) return _offscreenReadyPromise;
+
+  _offscreenReadyPromise = (async () => {
+    // Check whether the offscreen document is already open
+    const existing = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)]
+    });
+    if (existing.length > 0) return;
+
+    await chrome.offscreen.createDocument({
+      url: chrome.runtime.getURL(OFFSCREEN_URL),
+      reasons: ['BLOBS'],
+      justification: 'PDF text extraction with pdf.js (requires DOM and Worker API)'
+    });
+  })();
+
+  try {
+    await _offscreenReadyPromise;
+  } catch (err) {
+    _offscreenReadyPromise = null; // don't cache a failed attempt — allow retry
+    throw err;
+  }
 }
 
 // ─── Base64 helper (reuses same chunked approach as background.js) ────────────

@@ -721,6 +721,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               usedFilenames.add(uniqueFilename.toLowerCase());
               realFilename = uniqueFilename;
 
+              // Bail before the (potentially slow) extraction/conversion work below —
+              // with concurrent workers, a file can reach this point well after Stop
+              // was clicked, since only the fetch itself observes stopSignal mid-flight.
+              if (stopSignal.aborted) throw new Error('Stopped by user.');
+
               // ── PDF → TXT conversion ─────────────────────────────────────
               const isPdf = mimeType.includes('pdf') ||
                 realFilename.toLowerCase().endsWith('.pdf');
@@ -884,30 +889,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               return; // Skip this file
             }
 
+            // Bail before writing to disk if Stop was clicked while extraction was
+            // still running — avoids one more file landing on disk after Stop.
+            if (stopSignal.aborted) throw new Error('Stopped by user.');
+
             // ── Save to disk using the CORRECTED filename ──
             // Reuse the blob already fetched above instead of hitting file.url again —
             // avoids downloading every attachment twice (fetch() + chrome.downloads).
-            const rawDataUrl = await blobToDataUrl(blob);
-            await new Promise((resolve) => {
-              const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(realFilename)}`;
-              chrome.downloads.download({ url: rawDataUrl, filename: destFilename, saveAs: false }, (downloadId) => {
-                if (chrome.runtime.lastError || downloadId === undefined) {
-                  notifyAribaTab(tabId, `Disk download failed: ${realFilename}`, true);
-                  resolve();
-                  return;
-                }
-                diskDownloadIds.push(downloadId);
-                const onChanged = (delta) => {
-                  if (delta.id !== downloadId) return;
-                  if (delta.state?.current === 'interrupted' || delta.state?.current === 'complete') {
-                    chrome.downloads.onChanged.removeListener(onChanged);
+            // Guarded in its own try/catch so a failure here (e.g. blobToDataUrl choking
+            // on an oversized file) only skips this one file instead of throwing out of
+            // processFile and aborting the whole batch via firstFatalError.
+            try {
+              const rawDataUrl = await blobToDataUrl(blob);
+              await new Promise((resolve) => {
+                const destFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(realFilename)}`;
+                chrome.downloads.download({ url: rawDataUrl, filename: destFilename, saveAs: false }, (downloadId) => {
+                  if (chrome.runtime.lastError || downloadId === undefined) {
+                    notifyAribaTab(tabId, `Disk download failed: ${realFilename}`, true);
+                    resolve();
+                    return;
                   }
-                };
-                chrome.downloads.onChanged.addListener(onChanged);
-                setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 300_000);
-                resolve();
+                  diskDownloadIds.push(downloadId);
+                  const onChanged = (delta) => {
+                    if (delta.id !== downloadId) return;
+                    if (delta.state?.current === 'interrupted' || delta.state?.current === 'complete') {
+                      chrome.downloads.onChanged.removeListener(onChanged);
+                    }
+                  };
+                  chrome.downloads.onChanged.addListener(onChanged);
+                  setTimeout(() => chrome.downloads.onChanged.removeListener(onChanged), 300_000);
+                  resolve();
+                });
               });
-            });
+            } catch (err) {
+              notifyAribaTab(tabId, `Disk save failed for "${realFilename}": ${err.message}`, true);
+              return; // Skip this file
+            }
           }
 
           // Run processFile with bounded concurrency instead of one file at a time.
