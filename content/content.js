@@ -37,7 +37,22 @@
 
   // ── Only run in the relevant Ariba frame ──────────────────────────────
   const allButtons = Array.from(document.querySelectorAll('[aria-label="expand"]'));
-  const supplierElement = document.querySelector('.supplier-name');
+  let supplierElement = document.querySelector('.supplier-name');
+  if (!supplierElement) {
+    try {
+      let currWindow = window;
+      while (currWindow !== window.top) {
+        currWindow = currWindow.parent;
+        const el = currWindow.document.querySelector('.supplier-name') || currWindow.document.getElementById('supplier-name');
+        if (el) {
+          supplierElement = el;
+          break;
+        }
+      }
+    } catch (e) {
+      console.warn('[Ariba Ext] Cannot access parent frame for supplier name:', e);
+    }
+  }
   const allAnchors = Array.from(document.querySelectorAll('.file-name-container a.file-name'));
 
   console.log('[Ariba Ext] Initial check:', {
@@ -136,6 +151,33 @@
       .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem chars
       .replace(/\.+$/, '')              // Windows: no trailing periods
       .trim();
+
+    // Cache the supplier name in chrome.storage so other frames can read it (e.g. cross-origin iframes)
+    chrome.storage.local.set({ lastSupplierName: supplierName, lastRawSupplierName: rawSupplierName }).catch(err => {
+      console.warn('[Ariba Ext] Failed to write supplier name to storage:', err);
+    });
+  }
+
+  // If this frame couldn't find the supplier name locally, try to fetch it from shared storage
+  if (supplierName === 'Unknown Supplier' || !supplierName) {
+    try {
+      const stored = await chrome.storage.local.get(['lastSupplierName', 'lastRawSupplierName']);
+      if (stored.lastSupplierName) {
+        supplierName = stored.lastSupplierName;
+        rawSupplierName = stored.lastRawSupplierName || stored.lastSupplierName;
+        console.log('[Ariba Ext] Retrieved supplier name from storage:', supplierName);
+      }
+    } catch (err) {
+      console.warn('[Ariba Ext] Failed to read supplier name from storage:', err);
+    }
+  }
+
+  // If this frame has no questionnaire components (expand buttons or anchors), it is a metadata helper frame.
+  // We return early to avoid unnecessary processing, waiting, or displaying warning toasts.
+  if (allButtons.length === 0 && allAnchors.length === 0) {
+    console.log('[Ariba Ext] Helper frame finished caching supplier name. Returning early.');
+    window.__aribaAutomationRunning = false;
+    return;
   }
 
   try {
@@ -271,6 +313,20 @@
     }
 
     console.log('[Ariba Ext] Extracted QA Data:', extractedQAData);
+
+    // Double check storage one final time in case the helper frame saved it while we were expanding sections
+    if (supplierName === 'Unknown Supplier' || !supplierName) {
+      try {
+        const stored = await chrome.storage.local.get(['lastSupplierName', 'lastRawSupplierName']);
+        if (stored.lastSupplierName) {
+          supplierName = stored.lastSupplierName;
+          rawSupplierName = stored.lastRawSupplierName || stored.lastSupplierName;
+          console.log('[Ariba Ext] Final check retrieved supplier name from storage:', supplierName);
+        }
+      } catch (err) {
+        console.warn('[Ariba Ext] Failed to read supplier name from storage on final check:', err);
+      }
+    }
 
     // Step 3: Send to background for disk download
     chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, rawSupplierName, workspaceTitle, files, extractedQAData });

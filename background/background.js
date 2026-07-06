@@ -625,6 +625,22 @@ function clearStopSignal() {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   (async () => {
 
+    if (request.action === 'fetchGistText') {
+      try {
+        const url = `${GIST_URL}?t=${Date.now()}`;
+        const response = await fetch(url, { cache: 'no-store' });
+        if (!response.ok) {
+          sendResponse({ error: `HTTP ${response.status}: ${response.statusText}` });
+          return;
+        }
+        const text = await response.text();
+        sendResponse({ text });
+      } catch (err) {
+        sendResponse({ error: err.message || String(err) });
+      }
+      return;
+    }
+
     if (request.type === 'status') {
       // Relay status updates to the toast on the Ariba tab
       try {

@@ -80,6 +80,9 @@ document.addEventListener('DOMContentLoaded', () => {
         notebooklmConfig: { connectToNotebooklm, notebooklmUrl, deleteAfterUpload: deleteAfterUploadCheckbox.checked }
       });
 
+      // Clear any cached supplier name from a previous run to avoid stale data
+      await chrome.storage.local.remove(['lastSupplierName', 'lastRawSupplierName']);
+
       // Inject toast CSS before the script so classes are available on first call
       await chrome.scripting.insertCSS({
         target: { tabId: aribaTab.id, allFrames: true },

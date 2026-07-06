@@ -235,7 +235,7 @@ async function fetchSources(notebookId) {
   const url = `${NLM_API_BASE}?rpcids=${RPC_FETCH_SOURCES}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}&nlm_kit=true`;
 
   const envelope = [
-    'rLM1Ne',
+    RPC_FETCH_SOURCES,
     JSON.stringify([notebookId, null, [2], null, 0]),
     null,
     'generic'
@@ -339,7 +339,7 @@ async function deleteSource(notebookId, sourceId) {
   const formattedIds = [[[sourceId]], [2]];
 
   const envelope = [
-    'tGMBJ',
+    RPC_DELETE_SOURCE,
     JSON.stringify(formattedIds),
     null,
     'generic'
@@ -393,7 +393,7 @@ async function renameSource(notebookId, sourceId, newTitle) {
   const payload = [null, [sourceId], [[[newTitle]]]];
 
   const envelope = [
-    'b7Wfje',
+    RPC_RENAME_SOURCE,
     JSON.stringify(payload),
     null,
     'generic'
@@ -443,7 +443,7 @@ async function updateSystemInstruction(notebookId, newInstruction) {
   ];
 
   const envelope = [
-    's0tc2d',
+    RPC_SYNC_INSTRUCTIONS,
     JSON.stringify(payload),
     null,
     'generic'
@@ -1341,10 +1341,19 @@ async function syncInstructions() {
   const statusMsg = document.getElementById('sync-status');
 
   try {
-    const url = `${GIST_URL}?t=${Date.now()}`;
-    const response = await fetch(url, { cache: 'no-store' });
-    if (!response.ok) throw new Error('Failed to fetch from URL');
-    const text = await response.text();
+    const text = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ action: 'fetchGistText' }, (res) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (res && res.error) {
+          reject(new Error(res.error));
+        } else if (res && res.text) {
+          resolve(res.text);
+        } else {
+          reject(new Error('Failed to fetch from URL (unknown error)'));
+        }
+      });
+    });
 
     statusMsg.innerText = 'Updating Notebook...';
     await updateSystemInstruction(notebookId, text);
@@ -1386,7 +1395,7 @@ async function fetchLabels(notebookId) {
   const url = `${NLM_API_BASE}?rpcids=${RPC_FETCH_LABELS}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
 
   const envelope = [
-    'agX4Bc',
+    RPC_FETCH_LABELS,
     JSON.stringify([[2], notebookId, null, null, []]),
     null,
     'generic'
@@ -1515,7 +1524,7 @@ async function updateLabelAssignment(notebookId, sourceId, labelId, action) {
   const payload = [[2], notebookId, labelId, [actionPayload]];
 
   const envelope = [
-    'le8sX',
+    RPC_UPDATE_LABEL,
     JSON.stringify(payload),
     null,
     'generic'
