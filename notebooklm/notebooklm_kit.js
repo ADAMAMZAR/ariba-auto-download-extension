@@ -99,19 +99,23 @@ async function checkGistForChanges() {
   }
 
   try {
-    const url = `${GIST_URL}?t=${Date.now()}`;
-    console.log('[NLM Kit] Fetching gist from:', url);
+    console.log('[NLM Kit] Requesting background script to fetch gist:', GIST_URL);
+    const text = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ action: 'fetchGistText' }, (res) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (res && res.error) {
+          reject(new Error(res.error));
+        } else if (res && res.text) {
+          resolve(res.text);
+        } else {
+          reject(new Error('Failed to fetch from URL (unknown error)'));
+        }
+      });
+    });
 
-    const response = await fetch(url, { cache: 'no-store' });
-
-    if (!response.ok) {
-      console.warn('[NLM Kit] Gist fetch failed:', response.status, response.statusText);
-      return;
-    }
-
-    const text = await response.text();
     const hash = simpleHash(text);
-    console.log('[NLM Kit] Gist fetched OK. Hash:', hash);
+    console.log('[NLM Kit] Gist fetched OK via background. Hash:', hash);
 
     // Use localStorage so the baseline survives new tabs and browser restarts
     const storageKey = `nlm_synced_gist_hash_${getNotebookId()}`;

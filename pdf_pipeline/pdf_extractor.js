@@ -25,6 +25,9 @@ const OFFSCREEN_URL = 'pdf_pipeline/offscreen.html';
 let _offscreenReadyPromise = null;
 
 async function _ensureOffscreenDocument() {
+  if (typeof chrome.offscreen === 'undefined') {
+    throw new Error('This browser version does not support the Chrome Offscreen API (requires Chrome 109+).');
+  }
   if (_offscreenReadyPromise) return _offscreenReadyPromise;
 
   _offscreenReadyPromise = (async () => {

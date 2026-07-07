@@ -7,6 +7,35 @@
   }
   window.__aribaAutomationRunning = true;
 
+  // ── Localization Dictionaries for Ariba UI Language & Theme Customizations ──
+  const DESCRIPTION_LABELS = [
+    'description', 
+    'keterangan', 'penerangan', // Malay
+    'descripción',               // Spanish
+    'description',               // French
+    'beschreibung',              // German
+    'descrizione',               // Italian
+    '描述', '说明'                // Chinese
+  ];
+
+  const CERTIFICATE_TYPE_LABELS = [
+    'certificate type', 
+    'jenis sijil',               // Malay
+    'tipo de certificado',       // Spanish
+    'type de certificat',        // French
+    'zertifikatstyp',            // German
+    '证书类型', '證書類型'          // Chinese
+  ];
+
+  const CERTIFICATE_PREFIX_REGEXES = [
+    /^[0-9.]+\s+/, 
+    /^certificate of\s+/i, 
+    /^sijil\s+/i, 
+    /^certificado de\s+/i, 
+    /^certificat de\s+/i, 
+    /^zertifikat für\s+/i
+  ];
+
   // ── Toast notifications ───────────────────────────────────────────────
   // Styles live in content/content.css (injected via panel.js insertCSS).
   function showToast(text, isError = false) {
@@ -36,7 +65,12 @@
   }
 
   // ── Only run in the relevant Ariba frame ──────────────────────────────
-  const allButtons = Array.from(document.querySelectorAll('[aria-label="expand"]'));
+  // Select expand buttons using standard, fuzzy, and language-independent selectors
+  const allButtons = Array.from(document.querySelectorAll(
+    '[aria-label="expand"], [aria-label="collapse"], ' +
+    '[aria-label*="expand" i], [aria-label*="collapse" i], ' +
+    '[aria-expanded="false"], .expansion-button, .w-node-expand'
+  ));
   let supplierElement = document.querySelector('.supplier-name');
   if (!supplierElement) {
     try {
@@ -246,7 +280,10 @@
     const processedContainers = new Set();
 
     // Use a fresh query because the original buttons might have been destroyed/replaced by Angular
-    const currentExpansionButtons = Array.from(document.querySelectorAll('.expansion-button, [aria-label="collapse"], [aria-label="expand"]'));
+    const currentExpansionButtons = Array.from(document.querySelectorAll(
+      '.expansion-button, [aria-label="collapse"], [aria-label="expand"], ' +
+      '[aria-label*="expand" i], [aria-label*="collapse" i], [aria-expanded]'
+    ));
     console.log('[Ariba Ext] Found', currentExpansionButtons.length, 'expansion buttons for text extraction.');
 
     for (const btn of currentExpansionButtons) {
@@ -284,7 +321,8 @@
           const l = rowLabelEl.textContent.trim();
           const c = rowContentEl.textContent.trim();
 
-          if (l === 'Description') return;
+          // Skip description rows regardless of active language
+          if (DESCRIPTION_LABELS.includes(l.toLowerCase())) return;
 
           if (l) {
             qaBlock.answers.push({ label: l, value: c });
@@ -292,11 +330,15 @@
         }
       });
 
-      const certTypeAnswer = qaBlock.answers.find(a => a.label === 'Certificate Type');
+      // Find certificate type key in a language-resilient way
+      const certTypeAnswer = qaBlock.answers.find(a => 
+        CERTIFICATE_TYPE_LABELS.includes(a.label.toLowerCase())
+      );
       if (certTypeAnswer && !certTypeAnswer.value) {
         let derivedType = qaBlock.questionLabel;
-        derivedType = derivedType.replace(/^\d+\.\d+\s+/, '');
-        derivedType = derivedType.replace(/^Certificate of\s+/i, '');
+        for (const rx of CERTIFICATE_PREFIX_REGEXES) {
+          derivedType = derivedType.replace(rx, '');
+        }
         derivedType = derivedType.replace(/\([^)]+\)/g, '');
         derivedType = derivedType.split('-')[0];
         certTypeAnswer.value = derivedType.trim();

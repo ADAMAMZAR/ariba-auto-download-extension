@@ -27,13 +27,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // Both the URL field and the checkbox state are user preferences → chrome.storage.local.
   // Only ephemeral per-run state (notebooklmConfig) lives in chrome.storage.session.
   chrome.storage.local.get(['notebooklmUrl', 'connectToNotebooklm', 'deleteAfterUpload'], r => {
-    if (r.notebooklmUrl) notebooklmUrlInput.value = r.notebooklmUrl;
-    if (typeof r.connectToNotebooklm === 'boolean') {
-      connectCheckbox.checked = r.connectToNotebooklm;
-    }
-    if (typeof r.deleteAfterUpload === 'boolean') {
-      deleteAfterUploadCheckbox.checked = r.deleteAfterUpload;
-    }
+    notebooklmUrlInput.value = r.notebooklmUrl || '';
+    
+    // Default connection setting to true on first run (matching HTML initial state)
+    connectCheckbox.checked = typeof r.connectToNotebooklm === 'boolean' ? r.connectToNotebooklm : true;
+    
+    // Default delete setting to false on first run
+    deleteAfterUploadCheckbox.checked = typeof r.deleteAfterUpload === 'boolean' ? r.deleteAfterUpload : false;
+    
     notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
   });
 
@@ -54,6 +55,13 @@ document.addEventListener('DOMContentLoaded', () => {
     logEntries.innerHTML = '';
     setRunning(true);
     addLog('Starting extraction...', 'info');
+
+    // API Compatibility Check
+    if (typeof chrome.offscreen === 'undefined') {
+      addLog('Error: Your browser does not support the Chrome Offscreen API (requires Chrome 109+). Please update your browser.', 'error');
+      setRunning(false);
+      return;
+    }
 
     const connectToNotebooklm = connectCheckbox.checked;
     const notebooklmUrl = notebooklmUrlInput.value.trim();
