@@ -30,6 +30,59 @@ self.addEventListener('unhandledrejection', (event) => {
   });
 });
 
+// ─── Gist fetch helper ───────────────────────────────────────────────────────
+// Uses the GitHub Gist API instead of the raw CDN URL so we always get the
+// latest revision with no CDN caching layer and a much higher rate limit
+// (60 req/hr unauthenticated vs. the raw URL which is aggressively throttled).
+//
+// Returns the file text on success.
+// Throws a descriptive Error on failure (non-2xx, network error, parse error).
+async function fetchGistContent() {
+  let response;
+  try {
+    response = await fetch(GIST_API_URL, {
+      headers: { 'Accept': 'application/vnd.github+json' }
+    });
+  } catch (err) {
+    throw new Error('Network error fetching system instructions: ' + (err.message || String(err)));
+  }
+
+  if (!response.ok) {
+    // Include rate-limit reset time in the error when GitHub says 429/403
+    const resetEpoch = response.headers.get('X-RateLimit-Reset');
+    const resetInfo = resetEpoch
+      ? ` (rate limit resets at ${new Date(Number(resetEpoch) * 1000).toLocaleTimeString()})`
+      : '';
+    throw new Error(`HTTP ${response.status}: ${response.statusText}${resetInfo}`);
+  }
+
+  let json;
+  try {
+    json = await response.json();
+  } catch (err) {
+    throw new Error('Failed to parse Gist API response: ' + (err.message || String(err)));
+  }
+
+  const fileEntry = json?.files?.[GIST_FILE];
+  if (!fileEntry) {
+    throw new Error(`Gist file "${GIST_FILE}" not found in API response.`);
+  }
+
+  // The API inlines content for files ≤ 1 MB; for larger files it provides a
+  // raw_url — follow it as a fallback so we never silently get empty text.
+  if (fileEntry.content) {
+    return fileEntry.content;
+  }
+
+  if (fileEntry.raw_url) {
+    const rawRes = await fetch(fileEntry.raw_url);
+    if (!rawRes.ok) throw new Error(`Failed to fetch raw Gist content: HTTP ${rawRes.status}`);
+    return rawRes.text();
+  }
+
+  throw new Error('Gist API returned an entry with no content and no raw_url.');
+}
+
 // ─── Auto-Update ──────────────────────────────────────────────────────────────
 // Chrome auto-updates extensions from the Web Store, but only applies the
 // update when all extension tabs are closed or the browser restarts.
@@ -43,10 +96,101 @@ const UPDATE_ALARM = 'gpo-auto-update-check';
 
 // Register the hourly alarm once on install/startup.
 // chrome.alarms.create is idempotent if the alarm already exists.
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   chrome.alarms.create(UPDATE_ALARM, { periodInMinutes: 60 });
   console.log('[Ariba Ext] Auto-update alarm registered (every 60 min).');
+
+  if (details.reason === 'update') {
+    console.log(`[Ariba Ext] Updated from ${details.previousVersion} → ${chrome.runtime.getManifest().version}. Clearing extension cache...`);
+
+    // ── Clear chrome.storage.local cache keys ──────────────────────────────
+    // We intentionally PRESERVE user settings:
+    //   notebooklmUrl, connectToNotebooklm, deleteAfterUpload
+    // Everything else is transient state that becomes stale after an update.
+    try {
+      await chrome.storage.local.remove([
+        TELEMETRY_LOG_KEY,        // debug/telemetry ring buffer
+        'lastSupplierName',       // last-run ephemeral state
+        'lastRawSupplierName',
+      ]);
+      console.log('[Ariba Ext] chrome.storage.local cache cleared.');
+    } catch (e) {
+      console.warn('[Ariba Ext] Failed to clear local storage on update:', e?.message ?? e);
+    }
+
+    // ── Clear chrome.storage.session (all pending_* run state) ────────────
+    try {
+      await chrome.storage.session.clear();
+      console.log('[Ariba Ext] chrome.storage.session cleared.');
+    } catch (e) {
+      console.warn('[Ariba Ext] Failed to clear session storage on update:', e?.message ?? e);
+    }
+
+    // ── Clear stale gist-hash entries from NotebookLM localStorage ────────
+    // notebooklm_kit.js stores nlm_synced_gist_hash_<notebookId> in the
+    // NotebookLM page's localStorage so it can detect when the system
+    // instructions have changed. After an extension update those hashes are
+    // stale, so we wipe them here — the next page load will re-fetch and
+    // store a fresh baseline automatically.
+    try {
+      const tabs = await chrome.tabs.query({ url: 'https://notebooklm.google.com/*' });
+      for (const tab of tabs) {
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            const toRemove = Object.keys(localStorage).filter(k => k.startsWith('nlm_synced_gist_hash_'));
+            toRemove.forEach(k => localStorage.removeItem(k));
+            console.log('[Ariba Ext] Cleared stale gist-hash keys from NotebookLM localStorage:', toRemove);
+          }
+        }).catch(e => {
+          console.warn('[Ariba Ext] Could not clear NotebookLM localStorage on tab', tab.id, ':', e?.message ?? e);
+        });
+      }
+    } catch (e) {
+      console.warn('[Ariba Ext] Failed to query NotebookLM tabs on update:', e?.message ?? e);
+    }
+
+    // ── Notify open Ariba tabs to refresh ─────────────────────────────────
+    // content.js is a one-shot IIFE — it has no persistent onMessage listener,
+    // so sendMessage won't reach it in already-open tabs. Instead we inject a
+    // self-contained toast directly, nudging the user to refresh so the new
+    // content script code takes effect.
+    try {
+      const aribaTabs = await chrome.tabs.query({ url: '*://*.ariba.com/*' });
+      const newVersion = chrome.runtime.getManifest().version;
+      for (const tab of aribaTabs) {
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: (version) => {
+            // Reuse the existing toast container if it's already in the page,
+            // otherwise create a minimal one so the nudge always shows.
+            let container = document.getElementById('ariba-toast-container');
+            if (!container) {
+              container = document.createElement('div');
+              container.id = 'ariba-toast-container';
+              container.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999999;display:flex;flex-direction:column;gap:8px;';
+              document.body.appendChild(container);
+            }
+            const toast = document.createElement('div');
+            toast.style.cssText = 'background:#1a73e8;color:#fff;padding:10px 16px;border-radius:8px;font-family:sans-serif;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3);max-width:300px;line-height:1.4;';
+            toast.textContent = `✅ Extension updated to v${version}. Please refresh this page to load the latest code.`;
+            container.appendChild(toast);
+            setTimeout(() => toast.remove(), 8000);
+          },
+          args: [newVersion]
+        }).catch(e => {
+          console.warn('[Ariba Ext] Could not inject update toast on Ariba tab', tab.id, ':', e?.message ?? e);
+        });
+      }
+    } catch (e) {
+      console.warn('[Ariba Ext] Failed to query Ariba tabs on update:', e?.message ?? e);
+    }
+
+    console.log('[Ariba Ext] Extension cache cleared after update. User settings preserved.');
+
+  }
 });
+
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(UPDATE_ALARM, { periodInMinutes: 60 });
@@ -345,7 +489,7 @@ async function blobToDataUrl(blob) {
 let _diskSaveLock = Promise.resolve();
 function withDiskSaveLock(fn) {
   const run = _diskSaveLock.then(fn, fn);
-  _diskSaveLock = run.then(() => {}, () => {});
+  _diskSaveLock = run.then(() => { }, () => { });
   return run;
 }
 
@@ -496,19 +640,14 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
   // Note: filesForNotebook is received as a direct parameter, not from
   // session storage, to avoid the 10 MB session quota limit.
   notifyPanel('Fetching latest system instructions...');
-  let gistText = '';
+  let gistText;
   try {
-    // Append a timestamp to bypass GitHub's 5-minute CDN cache on raw Gist URLs.
-    // cache: 'no-store' also prevents the browser's own HTTP cache from interfering.
-    const gistResponse = await fetch(`${GIST_URL}?t=${Date.now()}`, { cache: 'no-store' });
-    if (gistResponse.ok) {
-      gistText = await gistResponse.text();
-    } else {
-      notifyPanel('Failed to fetch system instructions from Gist.', true);
-    }
+    gistText = await fetchGistContent();
   } catch (err) {
-    notifyPanel('Error fetching system instructions: ' + err.message, true);
-    notifyAribaTab(state.aribaTabId, 'Error fetching system instructions: ' + err.message, true);
+    const msg = 'Failed to fetch system instructions: ' + err.message;
+    notifyPanel(msg, true);
+    notifyAribaTab(state.aribaTabId, msg, true);
+    return; // ← stop completely; do NOT open NotebookLM with empty instructions
   }
 
   notifyPanel('Opening NotebookLM...');
@@ -627,13 +766,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.action === 'fetchGistText') {
       try {
-        const url = `${GIST_URL}?t=${Date.now()}`;
-        const response = await fetch(url, { cache: 'no-store' });
-        if (!response.ok) {
-          sendResponse({ error: `HTTP ${response.status}: ${response.statusText}` });
-          return;
-        }
-        const text = await response.text();
+        const text = await fetchGistContent();
         sendResponse({ text });
       } catch (err) {
         sendResponse({ error: err.message || String(err) });

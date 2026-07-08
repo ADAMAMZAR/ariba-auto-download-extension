@@ -9,7 +9,7 @@
 
   // ── Localization Dictionaries for Ariba UI Language & Theme Customizations ──
   const DESCRIPTION_LABELS = [
-    'description', 
+    'description',
     'keterangan', 'penerangan', // Malay
     'descripción',               // Spanish
     'description',               // French
@@ -19,7 +19,7 @@
   ];
 
   const CERTIFICATE_TYPE_LABELS = [
-    'certificate type', 
+    'certificate type',
     'jenis sijil',               // Malay
     'tipo de certificado',       // Spanish
     'type de certificat',        // French
@@ -28,11 +28,11 @@
   ];
 
   const CERTIFICATE_PREFIX_REGEXES = [
-    /^[0-9.]+\s+/, 
-    /^certificate of\s+/i, 
-    /^sijil\s+/i, 
-    /^certificado de\s+/i, 
-    /^certificat de\s+/i, 
+    /^[0-9.]+\s+/,
+    /^certificate of\s+/i,
+    /^sijil\s+/i,
+    /^certificado de\s+/i,
+    /^certificat de\s+/i,
     /^zertifikat für\s+/i
   ];
 
@@ -71,7 +71,31 @@
     '[aria-label*="expand" i], [aria-label*="collapse" i], ' +
     '[aria-expanded="false"], .expansion-button, .w-node-expand'
   ));
+
+  // ── Supplier name: multi-strategy lookup ─────────────────────────────
+  // Strategy 1: legacy .supplier-name class (older Ariba UI)
   let supplierElement = document.querySelector('.supplier-name');
+
+  // Strategy 2: Angular Ariba UI — common heading / breadcrumb selectors
+  if (!supplierElement) {
+    const candidates = [
+      '.supplier-header .name',
+      '.entity-name',
+      '[class*="supplier"][class*="name"]',
+      '.header-title',
+      '.page-title',
+      'h1',
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el && el.textContent.trim()) {
+        supplierElement = el;
+        break;
+      }
+    }
+  }
+
+  // Strategy 3: parent frame walk (works only when same-origin)
   if (!supplierElement) {
     try {
       let currWindow = window;
@@ -87,7 +111,9 @@
       console.warn('[Ariba Ext] Cannot access parent frame for supplier name:', e);
     }
   }
+
   const allAnchors = Array.from(document.querySelectorAll('.file-name-container a.file-name'));
+
 
   console.log('[Ariba Ext] Initial check:', {
     allButtons: allButtons.length,
@@ -192,17 +218,47 @@
     });
   }
 
-  // If this frame couldn't find the supplier name locally, try to fetch it from shared storage
+  // If this frame couldn't find the supplier name locally, try to fetch it from shared storage.
+  // Poll briefly (up to ~500ms) to let the main-frame injection finish writing it first
+  // — there is a race where the iframe reaches this point before the outer frame's
+  // chrome.storage.local.set() completes.
   if (supplierName === 'Unknown Supplier' || !supplierName) {
-    try {
-      const stored = await chrome.storage.local.get(['lastSupplierName', 'lastRawSupplierName']);
-      if (stored.lastSupplierName) {
-        supplierName = stored.lastSupplierName;
-        rawSupplierName = stored.lastRawSupplierName || stored.lastSupplierName;
-        console.log('[Ariba Ext] Retrieved supplier name from storage:', supplierName);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const stored = await chrome.storage.local.get(['lastSupplierName', 'lastRawSupplierName']);
+        if (stored.lastSupplierName) {
+          supplierName = stored.lastSupplierName;
+          rawSupplierName = stored.lastRawSupplierName || stored.lastSupplierName;
+          console.log('[Ariba Ext] Retrieved supplier name from storage (attempt', attempt + 1, '):', supplierName);
+          break;
+        }
+      } catch (err) {
+        console.warn('[Ariba Ext] Failed to read supplier name from storage:', err);
       }
-    } catch (err) {
-      console.warn('[Ariba Ext] Failed to read supplier name from storage:', err);
+      await new Promise(r => setTimeout(r, 100)); // wait 100ms between polls
+    }
+  }
+
+  // Strategy 4: parse the page <title> — Ariba always puts the supplier/event name there.
+  // Use this only as a last resort; titles vary in format across Ariba versions.
+  if (supplierName === 'Unknown Supplier' || !supplierName) {
+    const pageTitle = document.title.trim();
+    if (pageTitle && pageTitle !== 'Ariba' && pageTitle !== '') {
+      // Ariba titles are often like "Supplier Name | Ariba" or "Event - Supplier Name"
+      const titleParts = pageTitle.split(/[|\-–]/); // split on |, -, or em-dash
+      const candidate = titleParts[0].trim();
+      if (candidate && candidate.toLowerCase() !== 'ariba') {
+        rawSupplierName = candidate;
+        supplierName = candidate
+          .replace(/PTY LIMITED/gi, 'P/L')
+          .replace(/PTY LTD\.?/gi, 'P/L')
+          .replace(/The trustee of\s+/gi, 'TOF ')
+          .replace(/The trustee for\s+/gi, 'TOF ')
+          .replace(/[\/\\?%*:|"<>]/g, '-')
+          .replace(/\.+$/, '')
+          .trim();
+        console.log('[Ariba Ext] Supplier name derived from page title:', supplierName);
+      }
     }
   }
 
@@ -224,16 +280,37 @@
     }
 
     // Step 1: Expand all sections
+    // Helper: returns true if a button is already expanded (i.e. clicking it would COLLAPSE content).
+    // We must never click a button that is in this state.
+    function isAlreadyExpanded(btn) {
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      const iconText = btn.textContent.trim().toLowerCase();
+      // aria-label="collapse" → already open
+      if (label === 'collapse') return true;
+      // Material icon text "remove" = minus = already expanded
+      if (iconText === 'remove') return true;
+      // Any button whose aria-label starts with "toggle" and the icon says expand_less
+      if (label.startsWith('toggle') && iconText === 'expand_less') return true;
+      return false;
+    }
+
     if (expansionButtons.length > 0) {
       showToast(`Expanding ${expansionButtons.length} section(s)...`);
       for (const btn of expansionButtons) {
         if (window.__aribaStop) throw new Error('Stopped by user.');
+        // Re-check state at click time — the DOM may have changed since we queried
+        if (isAlreadyExpanded(btn)) {
+          console.log('[Ariba Ext] Skipping already-expanded button:', btn.getAttribute('aria-label'));
+          continue;
+        }
         btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
         ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
           btn.dispatchEvent(new MouseEvent(type, { view: window, bubbles: true, cancelable: true, buttons: 1 }));
         });
         try { btn.click(); } catch (e) { }
-        try { if (btn.parentElement) btn.parentElement.click(); } catch (e) { }
+        // NOTE: parentElement.click() is intentionally NOT called here.
+        // Clicking the parent container could accidentally collapse a section
+        // that was already expanded before the automation ran.
         await new Promise(r => setTimeout(r, 500));
       }
     }
@@ -331,7 +408,7 @@
       });
 
       // Find certificate type key in a language-resilient way
-      const certTypeAnswer = qaBlock.answers.find(a => 
+      const certTypeAnswer = qaBlock.answers.find(a =>
         CERTIFICATE_TYPE_LABELS.includes(a.label.toLowerCase())
       );
       if (certTypeAnswer && !certTypeAnswer.value) {

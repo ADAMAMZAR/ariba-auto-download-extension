@@ -29,7 +29,14 @@ var NLM_UPLOAD_BASE = 'https://notebooklm.google.com/upload/_/';
 
 // System instructions are fetched from this GitHub Gist so they can be
 // updated without releasing a new extension version.
-var GIST_URL = 'https://gist.githubusercontent.com/ADAMAMZAR/36c4a4e9da603de3c1bedfe76caf59f3/raw/55743f21f93398e8c2c178db92536a48b63d3f31/system_instruction';
+//
+// ⚠️  IMPORTANT: Always use GIST_API_URL for fetching content.
+//     The raw URL (gist.githubusercontent.com) is CDN-cached and heavily
+//     rate-limited. The Gist API always returns the latest revision with
+//     no CDN layer and a much higher rate limit (60 req/hr unauthenticated).
+var GIST_ID = '36c4a4e9da603de3c1bedfe76caf59f3';
+var GIST_FILE = 'system_instruction';
+var GIST_API_URL = `https://api.github.com/gists/${GIST_ID}`;
 
 // ── Extension behaviour ───────────────────────────────────────────────
 // Root folder used for all downloads (matches the extension name shown in Chrome)
