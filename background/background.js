@@ -1321,3 +1321,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   })();
   return true;
 });
+
+// ── Dynamic Content Script Injection ──────────────────────────────────────
+// Bypasses Chrome's stubborn manifest cache by injecting the latest
+// code programmatically every time a NotebookLM tab loads.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' && tab.url && tab.url.includes('notebooklm.google.com')) {
+    
+    // Inject CSS
+    chrome.scripting.insertCSS({
+      target: { tabId },
+      files: ['notebooklm/notebooklm_kit.css']
+    }).catch(err => {
+      // Ignore errors for chrome:// tabs or disconnected tabs
+      if (!err.message.includes('Cannot access contents of url')) {
+        console.warn('[Ariba Ext] CSS inject failed:', err);
+      }
+    });
+
+    // Inject JS
+    chrome.scripting.executeScript({
+      target: { tabId },
+      files: [
+        'shared/logger.js',
+        'shared/constants.js',
+        'notebooklm/notebooklm_kit.js'
+      ]
+    }).catch(err => {
+      if (!err.message.includes('Cannot access contents of url')) {
+        console.warn('[Ariba Ext] JS inject failed:', err);
+      }
+    });
+  }
+});
