@@ -197,7 +197,20 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 // Every hour: ask Chrome if a newer version is available in the Web Store.
+// Also handles the one-shot RELOAD_ALARM scheduled by onUpdateAvailable.
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === RELOAD_ALARM) {
+    // ── Pending-update reload ─────────────────────────────────────────────
+    // This alarm was scheduled by onUpdateAvailable when a new version was
+    // detected and no job was running.  We use an alarm instead of setTimeout
+    // because MV3 service workers can be terminated at any moment — a
+    // setTimeout callback would be silently dropped, but an alarm always
+    // wakes the worker and fires reliably.
+    console.log('[Ariba Ext] Reload alarm fired — applying pending extension update.');
+    chrome.runtime.reload();
+    return;
+  }
+
   if (alarm.name !== UPDATE_ALARM) return;
   chrome.runtime.requestUpdateCheck((status) => {
     console.log(`[Ariba Ext] Update check → ${status}`);
@@ -233,39 +246,50 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // When Chrome has a new version ready, decide whether to reload immediately
 // or defer until the active job finishes.
 //
-// _stopController is null when no download job is running (defined below at
-// the Stop Signal section).  We reference it via a getter so the hoisting
-// order doesn't matter — by the time onUpdateAvailable fires at runtime,
-// _stopController is always initialised.
+// ⚠️  MV3 SERVICE WORKER RELIABILITY NOTE:
+// setTimeout() is NOT reliable for deferred reloads in MV3 service workers.
+// Chrome can terminate the idle service worker before the timer fires,
+// silently dropping the callback — meaning chrome.runtime.reload() never runs.
+// We use chrome.alarms instead, which persists across worker restarts.
+//
+// RELOAD_ALARM is a one-shot alarm that fires after ~5 seconds and calls
+// chrome.runtime.reload() from the onAlarm listener (already set up above).
+const RELOAD_ALARM = 'gpo-pending-reload';
+
 chrome.runtime.onUpdateAvailable.addListener((details) => {
   const newVersion = details.version;
-  const jobIsActive = typeof _stopController !== 'undefined' && _stopController !== null;
 
-  if (jobIsActive) {
-    // ── A download is in progress — do NOT interrupt it ────────────────────
-    // Notify the user in the panel so they know an update is queued.
-    // Chrome will apply the update automatically the next time the browser
-    // restarts or all extension pages are closed.
-    console.log(`[Ariba Ext] Update v${newVersion} available — deferring (job in progress).`);
-    notifyPanel(
-      `⬆️ Extension update v${newVersion} is ready but will apply after your ` +
-      `current download finishes (or on next browser restart).`,
-      false,  // not an error
-      false   // not done
-    );
-  } else {
-    // ── Idle — safe to reload.  Warn the user first, then reload. ──────────
-    console.log(`[Ariba Ext] Update v${newVersion} available — reloading in 4 s.`);
-    notifyPanel(
-      `⬆️ Extension update v${newVersion} detected! Reloading in 4 seconds — ` +
-      `please reopen this panel afterwards.`,
-      false,
-      false
-    );
-    setTimeout(() => {
-      chrome.runtime.reload();
-    }, 4000); // 4-second window so the user can read the message
-  }
+  // Check whether a download job is currently active.
+  // We use chrome.storage.session as the source of truth because it survives
+  // service-worker restarts (unlike in-memory variables).
+  chrome.storage.session.get(['notebooklmConfig'], (result) => {
+    // notebooklmConfig is set at the start of a run and cleared when idle.
+    // If it exists, a job may be in progress — defer the reload.
+    const jobIsActive = !!(result && result.notebooklmConfig);
+
+    if (jobIsActive) {
+      // ── A download is in progress — do NOT interrupt it ────────────────────
+      console.log(`[Ariba Ext] Update v${newVersion} available — deferring (job in progress).`);
+      notifyPanel(
+        `⬆️ Extension update v${newVersion} is ready but will apply after your ` +
+        `current download finishes (or on next browser restart).`,
+        false,  // not an error
+        false   // not done
+      );
+    } else {
+      // ── Idle — safe to reload using a chrome.alarm (setTimeout is unreliable) ──
+      console.log(`[Ariba Ext] Update v${newVersion} available — scheduling reload alarm in 5 s.`);
+      notifyPanel(
+        `⬆️ Extension update v${newVersion} detected! Reloading in 5 seconds — ` +
+        `please reopen this panel afterwards.`,
+        false,
+        false
+      );
+      // Schedule a one-shot alarm 5 seconds from now.
+      // The onAlarm listener below will call chrome.runtime.reload().
+      chrome.alarms.create(RELOAD_ALARM, { delayInMinutes: 5 / 60 });
+    }
+  });
 });
 
 
@@ -1284,6 +1308,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } finally {
         clearTimeout(timeoutHandle);
         clearStopSignal();
+        // Clear the run config so onUpdateAvailable doesn't see a stale
+        // 'notebooklmConfig' and wrongly treat it as an active job on the
+        // next update check (e.g. if Chrome was closed mid-run last time).
+        chrome.storage.session.remove('notebooklmConfig').catch(() => { });
       }
     }
 

@@ -97,6 +97,28 @@ document.addEventListener('DOMContentLoaded', () => {
         files: ['content/content.css']
       });
 
+      // ── Stale-script guard ────────────────────────────────────────────────
+      // Content scripts are NEVER auto-replaced after an extension update;
+      // they keep running the old code until the tab is refreshed.
+      // We stamp the current extension version on the window and clear the
+      // re-entrant guard whenever the version has changed, so the freshly
+      // injected content.js always runs with up-to-date code.
+      const currentVersion = chrome.runtime.getManifest().version;
+      await chrome.scripting.executeScript({
+        target: { tabId: aribaTab.id, allFrames: true },
+        func: (version) => {
+          if (window.__aribaContentVersion && window.__aribaContentVersion !== version) {
+            // Version changed — clear the re-entrant guard so the new script runs cleanly
+            console.log(`[Ariba Ext] Version changed (${window.__aribaContentVersion} → ${version}). Clearing stale content script state.`);
+            window.__aribaAutomationRunning = false;
+            window.__aribaStop = false;
+            window.hasAribaToastListener = false;
+          }
+          window.__aribaContentVersion = version;
+        },
+        args: [currentVersion]
+      });
+
       await chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
         files: ['content/content.js']
