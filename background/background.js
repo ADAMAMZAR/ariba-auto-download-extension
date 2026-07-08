@@ -150,15 +150,18 @@ chrome.runtime.onInstalled.addListener(async (details) => {
       console.warn('[Ariba Ext] Failed to query NotebookLM tabs on update:', e?.message ?? e);
     }
 
-    // ── Notify open Ariba tabs to refresh ─────────────────────────────────
-    // content.js is a one-shot IIFE — it has no persistent onMessage listener,
-    // so sendMessage won't reach it in already-open tabs. Instead we inject a
+    // ── Notify open tabs to refresh ───────────────────────────────────────
+    // content.js and notebooklm_kit.js are content scripts — they don't auto-
+    // replace in already-open tabs after an extension update. We inject a
     // self-contained toast directly, nudging the user to refresh so the new
-    // content script code takes effect.
+    // code (like new Delete UI or bug fixes) takes effect.
     try {
       const aribaTabs = await chrome.tabs.query({ url: '*://*.ariba.com/*' });
+      const nlmTabs = await chrome.tabs.query({ url: '*://notebooklm.google.com/*' });
+      const allTabsToNudge = [...aribaTabs, ...nlmTabs];
+      
       const newVersion = chrome.runtime.getManifest().version;
-      for (const tab of aribaTabs) {
+      for (const tab of allTabsToNudge) {
         chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: (version) => {
@@ -179,11 +182,11 @@ chrome.runtime.onInstalled.addListener(async (details) => {
           },
           args: [newVersion]
         }).catch(e => {
-          console.warn('[Ariba Ext] Could not inject update toast on Ariba tab', tab.id, ':', e?.message ?? e);
+          console.warn('[Ariba Ext] Could not inject update toast on tab', tab.id, ':', e?.message ?? e);
         });
       }
     } catch (e) {
-      console.warn('[Ariba Ext] Failed to query Ariba tabs on update:', e?.message ?? e);
+      console.warn('[Ariba Ext] Failed to query tabs on update:', e?.message ?? e);
     }
 
     console.log('[Ariba Ext] Extension cache cleared after update. User settings preserved.');
