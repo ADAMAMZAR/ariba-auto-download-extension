@@ -78,6 +78,23 @@
     '#supplier-name, [aria-label^="Supplier name " i], .supplier-name'
   );
 
+  // Strategy 1.5: Task View layout (sm-key-value pairs)
+  if (!supplierElement) {
+    const keyNodes = Array.from(document.querySelectorAll('.key-value-container .key.line'));
+    for (const keyNode of keyNodes) {
+      if (keyNode.textContent.trim().toLowerCase() === 'supplier') {
+        const container = keyNode.closest('.key-value-container');
+        if (container) {
+          const valNode = container.querySelector('.link.line, .value.line');
+          if (valNode && valNode.textContent.trim()) {
+            supplierElement = valNode;
+            break;
+          }
+        }
+      }
+    }
+  }
+
   // Strategy 2: Angular Ariba UI — common heading / breadcrumb selectors
   if (!supplierElement) {
     const candidates = [
