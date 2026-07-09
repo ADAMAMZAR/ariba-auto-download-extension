@@ -150,23 +150,59 @@ chrome.runtime.onInstalled.addListener(async (details) => {
       console.warn('[Ariba Ext] Failed to query NotebookLM tabs on update:', e?.message ?? e);
     }
 
-    // ── Notify open tabs to refresh ───────────────────────────────────────
-    // content.js and notebooklm_kit.js are content scripts — they don't auto-
-    // replace in already-open tabs after an extension update. We inject a
-    // self-contained toast directly, nudging the user to refresh so the new
-    // code (like new Delete UI or bug fixes) takes effect.
+    // ── Live re-inject NLM kit into open NotebookLM tabs ─────────────────
+    // Instead of just asking the user to refresh, we push the new scripts
+    // directly into already-open tabs so they pick up the update immediately.
+    // Steps:
+    //  1. Clear window.__nlmKitInjected so the new script's re-entry guard
+    //     doesn't block re-execution.
+    //  2. Inject the updated CSS (insertCSS is idempotent; duplicates are
+    //     de-duped by the browser).
+    //  3. Inject the updated JS — the guard at the top of notebooklm_kit.js
+    //     now sets __nlmKitInjected = true again after running, and the
+    //     floating widget replaces itself by id.
     try {
-      const aribaTabs = await chrome.tabs.query({ url: '*://*.ariba.com/*' });
       const nlmTabs = await chrome.tabs.query({ url: '*://notebooklm.google.com/*' });
-      const allTabsToNudge = [...aribaTabs, ...nlmTabs];
-      
       const newVersion = chrome.runtime.getManifest().version;
-      for (const tab of allTabsToNudge) {
+      for (const tab of nlmTabs) {
+        // Step 1: clear the re-entry guard so the new script body runs
         chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: (version) => {
-            // Reuse the existing toast container if it's already in the page,
-            // otherwise create a minimal one so the nudge always shows.
+            window.__nlmKitInjected = false;
+            console.log(`[Ariba Ext] Cleared NLM kit guard for live update to v${version}.`);
+          },
+          args: [newVersion]
+        }).then(() => {
+          // Step 2: inject updated CSS
+          chrome.scripting.insertCSS({
+            target: { tabId: tab.id },
+            files: ['notebooklm/notebooklm_kit.css']
+          }).catch(e => console.warn('[Ariba Ext] NLM CSS re-inject failed:', e?.message));
+
+          // Step 3: inject updated JS (logger + constants + kit)
+          chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['shared/logger.js', 'shared/constants.js', 'notebooklm/notebooklm_kit.js']
+          }).catch(e => console.warn('[Ariba Ext] NLM JS re-inject failed:', e?.message));
+        }).catch(e => {
+          console.warn('[Ariba Ext] Could not clear NLM kit guard on tab', tab.id, ':', e?.message ?? e);
+        });
+      }
+    } catch (e) {
+      console.warn('[Ariba Ext] Failed to re-inject NLM kit on update:', e?.message ?? e);
+    }
+
+    // ── Notify open Ariba tabs to refresh ─────────────────────────────────
+    // Ariba content.js is already inject-on-demand (runs only when the user
+    // clicks Download), so a simple informational toast is enough here.
+    try {
+      const aribaTabs = await chrome.tabs.query({ url: '*://*.ariba.com/*' });
+      const newVersion = chrome.runtime.getManifest().version;
+      for (const tab of aribaTabs) {
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: (version) => {
             let container = document.getElementById('ariba-toast-container');
             if (!container) {
               container = document.createElement('div');
@@ -176,17 +212,17 @@ chrome.runtime.onInstalled.addListener(async (details) => {
             }
             const toast = document.createElement('div');
             toast.style.cssText = 'background:#1a73e8;color:#fff;padding:10px 16px;border-radius:8px;font-family:sans-serif;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3);max-width:300px;line-height:1.4;';
-            toast.textContent = `✅ Extension updated to v${version}. Please refresh this page to load the latest code.`;
+            toast.textContent = `✅ Extension updated to v${version}. Click Download when ready — latest code will be loaded automatically.`;
             container.appendChild(toast);
             setTimeout(() => toast.remove(), 8000);
           },
           args: [newVersion]
         }).catch(e => {
-          console.warn('[Ariba Ext] Could not inject update toast on tab', tab.id, ':', e?.message ?? e);
+          console.warn('[Ariba Ext] Could not inject update toast on Ariba tab', tab.id, ':', e?.message ?? e);
         });
       }
     } catch (e) {
-      console.warn('[Ariba Ext] Failed to query tabs on update:', e?.message ?? e);
+      console.warn('[Ariba Ext] Failed to notify Ariba tabs on update:', e?.message ?? e);
     }
 
     console.log('[Ariba Ext] Extension cache cleared after update. User settings preserved.');
@@ -672,7 +708,7 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
     gistText = await fetchGistContent();
   } catch (err) {
     const msg = 'Failed to fetch system instructions: ' + err.message;
-    notifyPanel(msg, true);
+    notifyPanel(msg, true, true); // done:true so panel re-enables the Download button
     notifyAribaTab(state.aribaTabId, msg, true);
     return; // ← stop completely; do NOT open NotebookLM with empty instructions
   }
@@ -745,7 +781,7 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
       files: ['notebooklm/nlm_runner.js']
     }, (results) => {
       if (chrome.runtime.lastError) {
-        notifyPanel('Sync/Checkbox script error: ' + chrome.runtime.lastError.message, true);
+        notifyPanel('Sync/Checkbox script error: ' + chrome.runtime.lastError.message, true, true); // done:true so panel re-enables the Download button
         notifyAribaTab(state.aribaTabId, 'NotebookLM injection failed: ' + chrome.runtime.lastError.message, true);
         chrome.tabs.onUpdated.removeListener(listener);
         return;

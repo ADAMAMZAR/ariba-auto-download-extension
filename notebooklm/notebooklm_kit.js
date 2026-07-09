@@ -807,134 +807,194 @@ if (!window.__nlmKitInjected) {
       }, 800);
     }
 
-    // Create and inject the button
+    // Create and inject the floating widget.
+    // Appends to document.body so NLM page re-renders can't destroy it.
+    // Replaces itself cleanly by id when re-injected after an extension update.
     function injectButton() {
       const notebookId = getNotebookId();
-      const existingContainer = document.getElementById('nlm-bulk-actions-container');
 
+      // Remove widget if we're on a non-notebook page (e.g. the NLM home/list)
       if (!notebookId) {
-        if (existingContainer) existingContainer.remove();
+        const existing = document.getElementById('nlm-floating-widget');
+        if (existing) existing.remove();
         return;
       }
 
-      // Find an element containing exactly "Sources"
-      const xpath = "//div[text()='Sources'] | //span[text()='Sources'] | //h2[text()='Sources'] | //h3[text()='Sources']";
-      const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      // Always remove any existing widget before recreating.
+      // This ensures re-injected code (e.g. after an extension update) always
+      // produces a fresh widget with the latest markup — not the stale one.
+      const existing = document.getElementById('nlm-floating-widget');
+      if (existing) existing.remove();
 
-      let targetNode = null;
-      for (let i = 0; i < result.snapshotLength; i++) {
-        const node = result.snapshotItem(i);
-        // Ensure element is visible
-        if (node.offsetParent !== null) {
-          targetNode = node;
-          break;
-        }
-      }
+      const version = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getManifest)
+        ? chrome.runtime.getManifest().version
+        : '';
 
-      if (!targetNode) {
-        if (existingContainer) existingContainer.remove();
-        return;
-      }
+      // ── Widget root ────────────────────────────────────────────────────────
+      const widget = document.createElement('div');
+      widget.id = 'nlm-floating-widget';
 
-      // If the container exists, ensure it's still right next to our target node
-      if (existingContainer) {
-        if (existingContainer.previousElementSibling === targetNode) {
-          // Container is in the right place — just refresh the sync button visibility
-          const syncBtn = document.getElementById('bulk-sync-btn');
-          if (syncBtn) syncBtn.style.display = isCQCheckerNotebook() ? '' : 'none';
-          return;
-        } else {
-          existingContainer.remove(); // Re-inject it in the correct spot
-        }
-      }
+      // ── Button tray (hidden until expanded) ────────────────────────────────
+      const tray = document.createElement('div');
+      tray.className = 'nlm-widget-tray';
 
-      const container = document.createElement('div');
-      container.id = 'nlm-bulk-actions-container';
-      container.className = 'nlm-btn-inline';
-      container.style.display = 'flex';
-      container.style.gap = '4px';
-      container.style.alignItems = 'center';
-
-      // Pencil button (Rename)
-      const renameBtn = document.createElement('button');
-      renameBtn.id = 'bulk-rename-btn';
-      renameBtn.title = 'Bulk Rename Sources';
-      renameBtn.onclick = openRenameModal;
-      renameBtn.className = 'nlm-action-btn rename-btn';
-      renameBtn.innerHTML = `
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
-    </svg>
-  `;
-
-      // Trash button (Delete)
-      const deleteBtn = document.createElement('button');
-      deleteBtn.id = 'bulk-delete-btn';
-      deleteBtn.title = 'Manage / Bulk Delete Sources';
-      deleteBtn.onclick = openManageModal;
-      deleteBtn.className = 'nlm-action-btn delete-btn';
-      deleteBtn.innerHTML = `
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#d93025" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <polyline points="3 6 5 6 21 6"></polyline>
-      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-      <line x1="10" y1="11" x2="10" y2="17"></line>
-      <line x1="14" y1="11" x2="14" y2="17"></line>
-    </svg>
-  `;
-
-      // Sync toggle button — only shown for "CQ Checker - ..." notebooks
+      // Sync button — only visible for CQ Checker notebooks
       const syncBtn = document.createElement('button');
       syncBtn.id = 'bulk-sync-btn';
       syncBtn.title = 'Sync System Instructions';
       syncBtn.onclick = syncInstructions;
       syncBtn.className = 'nlm-action-btn';
       syncBtn.style.display = isCQCheckerNotebook() ? '' : 'none';
-      syncBtn.innerHTML = `
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 2v6h-6"></path>
-      <path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path>
-      <path d="M3 22v-6h6"></path>
-      <path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path>
-    </svg>
-  `;
+      syncBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path></svg>`;
 
-      // Label toggle button
+      const sep1 = document.createElement('span');
+      sep1.id = 'nlm-widget-sep-sync'; // referenced after title loads to update visibility
+      sep1.className = 'nlm-widget-sep';
+      sep1.style.display = 'none'; // hidden by default; shown once title confirms CQ Checker
+
       const labelBtn = document.createElement('button');
       labelBtn.id = 'bulk-label-btn';
       labelBtn.title = 'Bulk Assign Label';
       labelBtn.onclick = openLabelModal;
       labelBtn.className = 'nlm-action-btn';
-      labelBtn.innerHTML = `
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
-      <line x1="7" y1="7" x2="7.01" y2="7"></line>
-    </svg>
-  `;
+      labelBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg>`;
 
-      container.appendChild(syncBtn);
-      container.appendChild(labelBtn);
-      container.appendChild(renameBtn);
-      container.appendChild(deleteBtn);
+      const sep2 = document.createElement('span');
+      sep2.className = 'nlm-widget-sep';
 
-      // Start source-dependent buttons as disabled until the background check confirms sources exist
-      deleteBtn.disabled = true;
-      renameBtn.disabled = true;
+      const renameBtn = document.createElement('button');
+      renameBtn.id = 'bulk-rename-btn';
+      renameBtn.title = 'Bulk Rename Sources';
+      renameBtn.onclick = openRenameModal;
+      renameBtn.className = 'nlm-action-btn';
+      renameBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`;
+
+      const sep3 = document.createElement('span');
+      sep3.className = 'nlm-widget-sep';
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.id = 'bulk-delete-btn';
+      deleteBtn.title = 'Manage / Bulk Delete Sources';
+      deleteBtn.onclick = openManageModal;
+      deleteBtn.className = 'nlm-action-btn';
+      deleteBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#d93025" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>`;
+
+      // Disable source-dependent buttons until background source check completes
       labelBtn.disabled = true;
+      renameBtn.disabled = true;
+      deleteBtn.disabled = true;
 
-      targetNode.insertAdjacentElement('afterend', container);
+      tray.appendChild(syncBtn);
+      tray.appendChild(sep1);
+      tray.appendChild(labelBtn);
+      tray.appendChild(sep2);
+      tray.appendChild(renameBtn);
+      tray.appendChild(sep3);
+      tray.appendChild(deleteBtn);
 
-      // Ensure parent aligns the text and the new icons cleanly
-      if (targetNode.parentElement) {
-        targetNode.parentElement.style.display = 'flex';
-        targetNode.parentElement.style.alignItems = 'center';
-      }
+      // ── Pill toggle (collapsed by default) ─────────────────────────────────
+      const pill = document.createElement('div');
+      pill.className = 'nlm-widget-pill';
+      pill.setAttribute('role', 'button');
+      pill.setAttribute('aria-label', 'GPO NLM Kit — click to expand');
+
+      pill.innerHTML = `
+        <span class="nlm-widget-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+          </svg>
+        </span>
+        <span class="nlm-widget-label">NLM Kit</span>
+        ${version ? `<span class="nlm-widget-version">v${version}</span>` : ''}
+        <span class="nlm-widget-chevron">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="18 15 12 9 6 15"/>
+          </svg>
+        </span>
+      `;
+
+      // ── Drag + click handler ────────────────────────────────────────────────
+      // mousedown tracks movement: < 5px = click (toggle tray), >= 5px = drag.
+      // This avoids a separate click listener fighting with the drag.
+      let _isDragging = false;
+      let _mouseDownX = 0, _mouseDownY = 0;
+      let _dragOffsetX = 0, _dragOffsetY = 0;
+
+      pill.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return; // left button only
+        _mouseDownX = e.clientX;
+        _mouseDownY = e.clientY;
+        _isDragging = false;
+
+        const rect = widget.getBoundingClientRect();
+        _dragOffsetX = e.clientX - rect.left;
+        _dragOffsetY = e.clientY - rect.top;
+
+        const onMouseMove = (ev) => {
+          const dx = ev.clientX - _mouseDownX;
+          const dy = ev.clientY - _mouseDownY;
+          if (!_isDragging && (Math.abs(dx) > 5 || Math.abs(dy) > 5)) {
+            _isDragging = true;
+            pill.style.cursor = 'grabbing';
+          }
+          if (_isDragging) {
+            const newLeft = ev.clientX - _dragOffsetX;
+            const newTop = ev.clientY - _dragOffsetY;
+            // Clamp within viewport so it can't be dragged off-screen
+            widget.style.left = Math.max(0, Math.min(window.innerWidth - widget.offsetWidth, newLeft)) + 'px';
+            widget.style.top = Math.max(0, Math.min(window.innerHeight - widget.offsetHeight, newTop)) + 'px';
+            widget.style.bottom = 'auto';
+            widget.style.right = 'auto';
+            widget.dataset.userMoved = 'true'; // prevent auto-anchoring from overriding user position
+          }
+        };
+
+        const onMouseUp = () => {
+          document.removeEventListener('mousemove', onMouseMove);
+          document.removeEventListener('mouseup', onMouseUp);
+          pill.style.cursor = '';
+          if (!_isDragging) {
+            // Short press = toggle tray open/closed
+            widget.classList.toggle('nlm-widget-open');
+          }
+          _isDragging = false;
+        };
+
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        e.preventDefault(); // prevent text selection while dragging
+      });
+
+      widget.appendChild(tray);
+      widget.appendChild(pill);
+      document.body.appendChild(widget);
+
+      // Try to anchor next to "Sources" immediately on creation.
+      // NLM may already have the sidebar rendered (e.g. navigating back to an
+      // open tab), so we position without waiting for the async title-load.
+      // If Sources isn't found yet (initial page load), the async block retries.
+      (function tryAnchorNow() {
+        const xpath = "//div[text()='Sources'] | //span[text()='Sources'] | //h2[text()='Sources'] | //h3[text()='Sources']";
+        const xr = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        for (let i = 0; i < xr.snapshotLength; i++) {
+          const node = xr.snapshotItem(i);
+          if (node.offsetParent !== null) {
+            const rect = node.getBoundingClientRect();
+            widget.style.top = Math.max(8, Math.round(rect.top + rect.height / 2 - 16)) + 'px';
+            widget.style.left = Math.round(rect.right + 10) + 'px';
+            widget.style.bottom = 'auto';
+            widget.style.right = 'auto';
+            widget.dataset.sourcesAnchored = 'true'; // skip re-anchor in async block
+            return;
+          }
+        }
+        // Sources not found yet — async block will retry after page renders
+      })();
 
       // Kick off background source check to enable buttons if sources are present
-      const nbId = getNotebookId();
-      if (nbId) scheduleSourceCheck(nbId);
+      if (notebookId) scheduleSourceCheck(notebookId);
 
-      // Apply any pending sync state to the newly injected buttons
+      // Apply any pending sync state to the newly created buttons
       if (syncPending) updateSyncButtonState();
     }
 
@@ -988,13 +1048,57 @@ if (!window.__nlmKitInjected) {
       }
 
       await checkGistForChanges();
+
+      // ── Post-title-load updates ───────────────────────────────────────────
+      // isCQCheckerNotebook() is now reliable because the title is rendered.
+      // Update sync button + its separator (both hidden by default until here).
+      const syncBtnEl = document.getElementById('bulk-sync-btn');
+      const sep1El = document.getElementById('nlm-widget-sep-sync');
+      const isCQ = isCQCheckerNotebook();
+      if (syncBtnEl) syncBtnEl.style.display = isCQ ? '' : 'none';
+      if (sep1El) sep1El.style.display = isCQ ? '' : 'none';
+      if (isCQ && syncPending) updateSyncButtonState();
+
+      // ── Anchor widget next to the "Sources" element ───────────────────────
+      // Only run if the immediate attempt in injectButton() failed (Sources wasn't
+      // rendered yet). Skip if user has dragged the widget or it's already anchored.
+      const widgetEl = document.getElementById('nlm-floating-widget');
+      if (widgetEl && !widgetEl.dataset.userMoved && !widgetEl.dataset.sourcesAnchored) {
+        const xpath = "//div[text()='Sources'] | //span[text()='Sources'] | //h2[text()='Sources'] | //h3[text()='Sources']";
+        const xResult = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        for (let i = 0; i < xResult.snapshotLength; i++) {
+          const node = xResult.snapshotItem(i);
+          if (node.offsetParent !== null) {
+            const rect = node.getBoundingClientRect();
+            widgetEl.style.top = Math.max(8, Math.round(rect.top + rect.height / 2 - 16)) + 'px';
+            widgetEl.style.left = Math.round(rect.right + 10) + 'px';
+            widgetEl.style.bottom = 'auto';
+            widgetEl.style.right = 'auto';
+            widgetEl.dataset.sourcesAnchored = 'true';
+            break;
+          }
+        }
+      }
     })();
 
-    // Use MutationObserver to ensure the button stays on the page even if React re-renders
-    const observer = new MutationObserver(() => {
-      injectButton();
+    // Re-check if the widget needs to be removed/re-added when navigating between
+    // notebooks (NLM is a SPA — the URL changes but the page doesn't fully reload).
+    // We only need to check on URL change, not on every DOM mutation, since the
+    // widget lives outside the NLM DOM and can't be destroyed by re-renders.
+    let _lastWidgetPath = location.pathname;
+    const _navObserver = new MutationObserver(() => {
+      if (location.pathname !== _lastWidgetPath) {
+        _lastWidgetPath = location.pathname;
+        // Remove stale widget and re-inject for new notebook context
+        const stale = document.getElementById('nlm-floating-widget');
+        if (stale) stale.remove();
+        injectButton();
+        // Update sync button visibility for new notebook
+        const syncBtn = document.getElementById('bulk-sync-btn');
+        if (syncBtn) syncBtn.style.display = isCQCheckerNotebook() ? '' : 'none';
+      }
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    _navObserver.observe(document.body, { childList: true, subtree: false });
 
     // Intercept submit button clicks and Enter-key presses when a sync is required.
     // Uses the CAPTURING phase (true) so we fire before NotebookLM's own handlers.

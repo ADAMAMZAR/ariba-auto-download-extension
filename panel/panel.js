@@ -1,4 +1,8 @@
 document.addEventListener('DOMContentLoaded', () => {
+  // Populate the version badge from the manifest — always accurate, no network call needed
+  const versionEl = document.getElementById('ext-version');
+  if (versionEl) versionEl.textContent = 'v' + chrome.runtime.getManifest().version;
+
   const downloadBtn = document.getElementById('download-btn');
   const stopBtn     = document.getElementById('stop-btn');
   const connectCheckbox = document.getElementById('connect-notebooklm');
@@ -97,23 +101,25 @@ document.addEventListener('DOMContentLoaded', () => {
         files: ['content/content.css']
       });
 
-      // ── Stale-script guard ────────────────────────────────────────────────
-      // Content scripts are NEVER auto-replaced after an extension update;
-      // they keep running the old code until the tab is refreshed.
-      // We stamp the current extension version on the window and clear the
-      // re-entrant guard whenever the version has changed, so the freshly
-      // injected content.js always runs with up-to-date code.
+      // ── Pre-injection state reset ─────────────────────────────────────────
+      // Always reset execution flags before each injection run.
+      // The Download button is disabled (setRunning) for the entire duration
+      // of a run, so a concurrent double-injection cannot happen — resetting
+      // here unconditionally is safe and ensures the re-entrant guard in
+      // content.js never silently blocks a legitimate second run.
+      // We also stamp the current version so content.js can detect stale
+      // code left behind from a previous extension version on an open tab.
       const currentVersion = chrome.runtime.getManifest().version;
       await chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
         func: (version) => {
           if (window.__aribaContentVersion && window.__aribaContentVersion !== version) {
-            // Version changed — clear the re-entrant guard so the new script runs cleanly
-            console.log(`[Ariba Ext] Version changed (${window.__aribaContentVersion} → ${version}). Clearing stale content script state.`);
-            window.__aribaAutomationRunning = false;
-            window.__aribaStop = false;
-            window.hasAribaToastListener = false;
+            console.log(`[Ariba Ext] Version changed (${window.__aribaContentVersion} → ${version}). Resetting content script state.`);
           }
+          // Always clear state so every button click starts fresh
+          window.__aribaAutomationRunning = false;
+          window.__aribaStop = false;
+          window.hasAribaToastListener = false;
           window.__aribaContentVersion = version;
         },
         args: [currentVersion]
