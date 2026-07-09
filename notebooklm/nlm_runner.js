@@ -190,6 +190,14 @@
     await wait(500);
   }
 
+  // ── Step 1.6: Collapse the studio panel if open ─────────────────────────
+  const collapseStudioBtn = document.querySelector('button[aria-label="Collapse studio panel"], button.toggle-studio-panel-button');
+  if (collapseStudioBtn) {
+    collapseStudioBtn.click();
+    sendStatus('Collapsed studio panel.');
+    await wait(300);
+  }
+
   // ── Step 2: Register + upload files via WIZ RPC (o4cbdc) and Scotty ──
   // MAINTENANCE: If registration fails (400), the RPC ID 'o4cbdc' may have rotated.
   // Fix: DevTools → Network → filter "batchexecute" → manually add a source → find new ID.

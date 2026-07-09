@@ -103,7 +103,7 @@ if (!window.__nlmKitInjected) {
       }
 
       try {
-        console.log('[NLM Kit] Requesting background script to fetch gist:', GIST_URL);
+        console.log('[NLM Kit] Requesting background script to fetch gist.');
         const text = await new Promise((resolve, reject) => {
           chrome.runtime.sendMessage({ action: 'fetchGistText' }, (res) => {
             if (chrome.runtime.lastError) {
@@ -1058,6 +1058,11 @@ if (!window.__nlmKitInjected) {
       if (syncBtnEl) syncBtnEl.style.display = isCQ ? '' : 'none';
       if (sep1El) sep1El.style.display = isCQ ? '' : 'none';
       if (isCQ && syncPending) updateSyncButtonState();
+
+      // Check for extension updates when a CQ Checker notebook is opened
+      if (isCQ) {
+        chrome.runtime.sendMessage({ action: 'checkForExtensionUpdates' }).catch(() => { });
+      }
 
       // ── Anchor widget next to the "Sources" element ───────────────────────
       // Only run if the immediate attempt in injectButton() failed (Sources wasn't

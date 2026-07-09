@@ -267,19 +267,22 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Debounced to at most once per minute to stay well inside Chrome's
 // requestUpdateCheck throttle limit (roughly 1 call / 5 s).
 let _lastAribaUpdateCheck = 0;
+function triggerExtensionUpdateCheck(sourceLabel) {
+  const now = Date.now();
+  if (now - _lastAribaUpdateCheck < 60_000) return; // debounce: once per minute
+  _lastAribaUpdateCheck = now;
+
+  chrome.runtime.requestUpdateCheck((status) => {
+    console.log(`[Ariba Ext] Update check (${sourceLabel}) → ${status}`);
+  });
+}
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   // Only fire when the Ariba page has fully loaded
   if (changeInfo.status !== 'complete') return;
   if (!tab.url || !tab.url.includes('.ariba.com')) return;
 
-  const now = Date.now();
-  if (now - _lastAribaUpdateCheck < 60_000) return; // debounce: once per minute
-  _lastAribaUpdateCheck = now;
-
-  chrome.runtime.requestUpdateCheck((status) => {
-    console.log(`[Ariba Ext] Update check (Ariba page load) → ${status}`);
-  });
+  triggerExtensionUpdateCheck('Ariba page load');
 });
 
 // When Chrome has a new version ready, decide whether to reload immediately
@@ -404,7 +407,8 @@ function captureFullPageScreenshot(tabId) {
 
             setTimeout(() => {
               chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
-                format: 'png',
+                format: 'jpeg',
+                quality: 60,
                 clip: clip,
                 captureBeyondViewport: true
               }, (result) => {
@@ -856,6 +860,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return;
     }
 
+    if (request.action === 'checkForExtensionUpdates') {
+      triggerExtensionUpdateCheck('CQ Notebook');
+      return;
+    }
+
     // ── Errors relayed from content scripts (content.js, notebooklm_kit.js) ──
     // These run on the page itself and previously only reached whichever
     // colleague's own DevTools console via console.error.
@@ -1290,8 +1299,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                 chrome.tabs.sendMessage(tabId, { action: 'showToasts' }).catch(() => { });
 
-                const imgDataUrl = `data:image/png;base64,${base64Png}`;
-                const imgFilename = `${s} - Screenshot.png`;
+                const imgDataUrl = `data:image/jpeg;base64,${base64Png}`;
+                const imgFilename = `${s} - Screenshot.jpeg`;
                 const destImgFilename = `${DOWNLOAD_ROOT}/${s}/${imgFilename}`;
 
                 const imgDownloadId = await new Promise((resolve) => {
