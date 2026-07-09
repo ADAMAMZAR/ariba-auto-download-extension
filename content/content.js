@@ -73,8 +73,10 @@
   ));
 
   // ── Supplier name: multi-strategy lookup ─────────────────────────────
-  // Strategy 1: legacy .supplier-name class (older Ariba UI)
-  let supplierElement = document.querySelector('.supplier-name');
+  // Strategy 1: strict ID/aria lookups (Newer Angular UI) or legacy class
+  let supplierElement = document.querySelector(
+    '#supplier-name, [aria-label^="Supplier name " i], .supplier-name'
+  );
 
   // Strategy 2: Angular Ariba UI — common heading / breadcrumb selectors
   if (!supplierElement) {
@@ -88,9 +90,13 @@
     ];
     for (const sel of candidates) {
       const el = document.querySelector(sel);
-      if (el && el.textContent.trim()) {
-        supplierElement = el;
-        break;
+      if (el) {
+        const txt = el.textContent.trim();
+        // Ignore generic tab names that might match loose selectors
+        if (txt && txt.toLowerCase() !== 'supplier management') {
+          supplierElement = el;
+          break;
+        }
       }
     }
   }
@@ -241,13 +247,13 @@
 
   // Strategy 4: parse the page <title> — Ariba always puts the supplier/event name there.
   // Use this only as a last resort; titles vary in format across Ariba versions.
-  if (supplierName === 'Unknown Supplier' || !supplierName) {
+  if (supplierName === 'Unknown Supplier' || !supplierName || supplierName.toLowerCase() === 'supplier management') {
     const pageTitle = document.title.trim();
     if (pageTitle && pageTitle !== 'Ariba' && pageTitle !== '') {
       // Ariba titles are often like "Supplier Name | Ariba" or "Event - Supplier Name"
       const titleParts = pageTitle.split(/[|\-–]/); // split on |, -, or em-dash
       const candidate = titleParts[0].trim();
-      if (candidate && candidate.toLowerCase() !== 'ariba') {
+      if (candidate && candidate.toLowerCase() !== 'ariba' && candidate.toLowerCase() !== 'supplier management') {
         rawSupplierName = candidate;
         supplierName = candidate
           .replace(/PTY LIMITED/gi, 'P/L')
@@ -260,6 +266,11 @@
         console.log('[Ariba Ext] Supplier name derived from page title:', supplierName);
       }
     }
+  }
+
+  // Final fallback safeguard: if we STILL have 'Supplier Management', revert to Unknown
+  if (supplierName.toLowerCase() === 'supplier management') {
+    supplierName = 'Unknown Supplier';
   }
 
   // If this frame has no questionnaire components (expand buttons or anchors), it is a metadata helper frame.
