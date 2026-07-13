@@ -34,6 +34,16 @@ if (!window.__nlmKitInjected) {
     let sourceListCache = {};
     const SOURCE_CACHE_TTL_MS = 30000; // safety net in case an invalidation event is ever missed
 
+    function isSystemInstructionTitle(title) {
+      if (!title) return false;
+      const normalized = title.trim().toLowerCase();
+      return normalized.includes('cq_checker_instruction') ||
+             normalized.includes('cq checker instruction') ||
+             normalized.includes('cq-checker-instruction') ||
+             normalized.includes('system_instruction') ||
+             normalized.includes('system instruction');
+    }
+
     // Returns the source list for notebookId, using the cache when it's still fresh.
     // Pass forceRefresh to bypass the cache (e.g. right after a mutation we can't
     // otherwise detect).
@@ -43,8 +53,9 @@ if (!window.__nlmKitInjected) {
         return cached.sources;
       }
       const sources = await fetchSources(notebookId);
-      sourceListCache[notebookId] = { sources, timestamp: Date.now() };
-      return sources;
+      const filteredSources = sources.filter(s => !isSystemInstructionTitle(s.title));
+      sourceListCache[notebookId] = { sources: filteredSources, timestamp: Date.now() };
+      return filteredSources;
     }
 
     function invalidateSourceCache(notebookId) {

@@ -1,10 +1,11 @@
 // ============================================================
 // constants.js — Single source of truth for all magic values
 //
-// Loaded in three contexts:
+// Loaded in four contexts:
 //   1. background/background.js (service worker) → via importScripts('../shared/constants.js')
 //   2. notebooklm/notebooklm_kit.js (content script) → loaded first in manifest content_scripts
 //   3. notebooklm/nlm_runner.js (MAIN world injection) → injected via files:[] before nlm_runner.js
+//   4. content/content.js (Ariba tabs) → injected via scripting.executeScript files:[] in panel.js
 //
 // Uses var so values land on globalThis and are accessible across
 // all script files loaded in the same context.
@@ -59,3 +60,26 @@ var TELEMETRY_ENDPOINT = 'https://script.google.com/a/macros/gamuda.com.my/s/AKf
 // Local ring-buffer settings (chrome.storage.local)
 var TELEMETRY_LOG_KEY = 'debugLog';
 var TELEMETRY_LOG_MAX = 50;
+
+// ── Supplier name sanitisation ────────────────────────────────────────────
+// Applied in both content.js (supplier element / page title text) and
+// background.js (cleanName). Centralised here so both contexts use identical
+// rules and can never silently drift apart.
+//
+// Each entry is [RegExp, replacement]. Applied in order via Array.reduce
+// in sanitiseSupplierName() (content.js) and cleanName() (background.js).
+//
+// ⚠️  NOTE: Quotes are stripped entirely (→ '') rather than replaced with
+//     a dash, because a dash between every letter of "O'Brien" looks wrong
+//     on disk. The PTY LTD negative-lookahead rule prevents swallowing a
+//     trailing dot that is actually part of a file extension.
+var SUPPLIER_CLEAN_RULES = [
+  [/["']/g,                                             ''],    // strip quotes entirely
+  [/PTY LIMITED/gi,                                     'P/L'],
+  [/PTY LTD\.(?!pdf|docx?|xlsx?|txt|jpe?g|png)/gi,     'P/L'], // PTY LTD. not before an extension
+  [/PTY LTD/gi,                                         'P/L'],
+  [/The trustee of\s+/gi,                               'TOF '],
+  [/The trustee for\s+/gi,                              'TOF '],
+  [/[\/\\?%*:|<>]/g,                                    '-'],   // illegal filesystem chars → dash
+  [/\.+$/,                                              ''],    // Windows: no trailing periods
+];

@@ -125,9 +125,11 @@ document.addEventListener('DOMContentLoaded', () => {
         args: [currentVersion]
       });
 
+      // shared/constants.js must be injected first so sanitiseSupplierName()
+      // in content.js has access to SUPPLIER_CLEAN_RULES at runtime.
       await chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
-        files: ['content/content.js']
+        files: ['shared/constants.js', 'content/content.js']
       });
 
     } catch (err) {

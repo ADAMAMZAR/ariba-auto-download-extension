@@ -36,6 +36,15 @@
     /^zertifikat für\s+/i
   ];
 
+  // ── Supplier name sanitiser ───────────────────────────────────────────
+  // Reads SUPPLIER_CLEAN_RULES from shared/constants.js (injected before this
+  // script by panel.js) so the logic is identical to cleanName() in background.js.
+  function sanitiseSupplierName(raw) {
+    return SUPPLIER_CLEAN_RULES
+      .reduce((s, [re, rep]) => s.replace(re, rep), raw)
+      .trim();
+  }
+
   // ── Toast notifications ───────────────────────────────────────────────
   // Styles live in content/content.css (injected via panel.js insertCSS).
   function showToast(text, isError = false) {
@@ -226,14 +235,7 @@
   let rawSupplierName = 'Unknown Supplier';
   if (supplierElement) {
     rawSupplierName = supplierElement.textContent.trim();
-    supplierName = rawSupplierName
-      .replace(/PTY LIMITED/gi, 'P/L')
-      .replace(/PTY LTD\.?/gi, 'P/L')
-      .replace(/The trustee of\s+/gi, 'TOF ')
-      .replace(/The trustee for\s+/gi, 'TOF ')
-      .replace(/[\/\\?%*:|"<>]/g, '-') // illegal filesystem chars
-      .replace(/\.+$/, '')              // Windows: no trailing periods
-      .trim();
+    supplierName = sanitiseSupplierName(rawSupplierName);
 
     // Cache the supplier name in chrome.storage so other frames can read it (e.g. cross-origin iframes)
     chrome.storage.local.set({ lastSupplierName: supplierName, lastRawSupplierName: rawSupplierName }).catch(err => {
@@ -272,14 +274,7 @@
       const candidate = titleParts[0].trim();
       if (candidate && candidate.toLowerCase() !== 'ariba' && candidate.toLowerCase() !== 'supplier management') {
         rawSupplierName = candidate;
-        supplierName = candidate
-          .replace(/PTY LIMITED/gi, 'P/L')
-          .replace(/PTY LTD\.?/gi, 'P/L')
-          .replace(/The trustee of\s+/gi, 'TOF ')
-          .replace(/The trustee for\s+/gi, 'TOF ')
-          .replace(/[\/\\?%*:|"<>]/g, '-')
-          .replace(/\.+$/, '')
-          .trim();
+        supplierName = sanitiseSupplierName(candidate);
         console.log('[Ariba Ext] Supplier name derived from page title:', supplierName);
       }
     }

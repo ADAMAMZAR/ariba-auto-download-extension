@@ -517,17 +517,13 @@ async function reportEvent(type, details = {}) {
 }
 
 function cleanName(n) {
-  return n
-    .replace(/["']/g, '')              // Strip quotes completely instead of making them dashes
-    .replace(/PTY LIMITED/gi, 'P/L')
-    .replace(/PTY LTD\.(?!pdf|docx?|xlsx?|txt|jpe?g|png)/gi, 'P/L')
-    .replace(/PTY LTD/gi, 'P/L')
-    .replace(/The trustee of\s+/gi, 'TOF ')
-    .replace(/The trustee for\s+/gi, 'TOF ')
-    .replace(/[\/\\?%*:|<>]/g, '-')    // Replace illegal filesystem characters with dashes
-    .replace(/\.+$/, '')               // Windows: names cannot end with a period
-    .trim();                           // no leading/trailing spaces
+  // Rules are defined in shared/constants.js (SUPPLIER_CLEAN_RULES) so that
+  // this function and sanitiseSupplierName() in content.js always stay in sync.
+  return SUPPLIER_CLEAN_RULES
+    .reduce((s, [re, rep]) => s.replace(re, rep), n)
+    .trim();
 }
+
 
 function uint8ArrayToBase64(bytes) {
   let binary = '';

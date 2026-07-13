@@ -46,6 +46,47 @@
     return match ? match[1] : null;
   };
 
+  const isSystemInstructionTitle = (title) => {
+    if (!title) return false;
+    const normalized = title.trim().toLowerCase();
+    return normalized.includes('cq_checker_instruction') ||
+           normalized.includes('cq checker instruction') ||
+           normalized.includes('cq-checker-instruction') ||
+           normalized.includes('system_instruction') ||
+           normalized.includes('system instruction');
+  };
+
+  const getSystemInstructionCheckbox = () => {
+    // 1. Look for checkboxes within containers that have "system_instruction" or "system instruction" text
+    const containers = document.querySelectorAll('.single-source-container, [class*="source-container"], [class*="source-item"]');
+    for (const container of containers) {
+      const text = (container.textContent || '').trim().toLowerCase();
+      if (isSystemInstructionTitle(text)) {
+        const cb = container.querySelector('input[type="checkbox"]');
+        if (cb) return cb;
+      }
+    }
+    // 2. Fallback: Search all checkboxes in the document
+    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+    for (const cb of checkboxes) {
+      const ariaLabel = (cb.getAttribute('aria-label') || '').toLowerCase();
+      if (isSystemInstructionTitle(ariaLabel) && !ariaLabel.includes('select all')) {
+        return cb;
+      }
+      let parent = cb.parentElement;
+      while (parent && parent !== document.body) {
+        const text = (parent.textContent || '').trim().toLowerCase();
+        if (isSystemInstructionTitle(text)) {
+          if (!ariaLabel.includes('select all')) {
+            return cb;
+          }
+        }
+        parent = parent.parentElement;
+      }
+    }
+    return null;
+  };
+
   /**
    * Read dynamic WIZ build params from the page.
    * The fallback values are the last known-good values — update them when
@@ -60,6 +101,36 @@
     };
   };
 
+  /**
+   * Fire a single batchexecute RPC call and return the raw Response.
+   *
+   * Centralises the repeated URLSearchParams envelope + fetch boilerplate so
+   * that Step 0 (sync instructions) and Step 2 (register files) share one
+   * implementation. A protocol change — e.g. a new required header or a
+   * different URL shape — only needs updating here.
+   *
+   * @param {string} rpcId     - The RPC action ID (e.g. RPC_SYNC_INSTRUCTIONS)
+   * @param {*}      payload   - The inner payload array (JSON.stringify'd inside)
+   * @param {object} wiz       - {bl, fSid, at} from getWizData()
+   * @param {string} notebookId
+   * @returns {Promise<Response>}
+   */
+  async function callBatchExecute(rpcId, payload, wiz, notebookId) {
+    const envelope = [rpcId, JSON.stringify(payload), null, 'generic'];
+    const formData = new URLSearchParams();
+    formData.set('f.req', JSON.stringify([[envelope]]));
+    formData.set('at', wiz.at);
+    const url =
+      `${NLM_API_BASE}?rpcids=${rpcId}&_reqid=${generateReqId()}` +
+      `&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0` +
+      `&source-path=%2Fnotebook%2F${notebookId}`;
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+      body: formData.toString()
+    });
+  }
+
   const notebookId = getNotebookId();
 
   // ── Step 0: Sync system instructions ─────────────────────────────────
@@ -73,8 +144,6 @@
 
       if (wiz.at) {
         try {
-          const url = `${NLM_API_BASE}?rpcids=${RPC_SYNC_INSTRUCTIONS}&_reqid=${generateReqId()}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
-
           const payload = [
             notebookId,
             [
@@ -94,16 +163,7 @@
             ]
           ];
 
-          const envelope = [RPC_SYNC_INSTRUCTIONS, JSON.stringify(payload), null, 'generic'];
-          const formData = new URLSearchParams();
-          formData.set('f.req', JSON.stringify([[envelope]]));
-          formData.set('at', wiz.at);
-
-          const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-            body: formData.toString()
-          });
+          const response = await callBatchExecute(RPC_SYNC_INSTRUCTIONS, payload, wiz, notebookId);
 
           if (response.ok) {
             sendStatus('System instructions synced successfully.');
@@ -160,15 +220,42 @@
     }
     await wait(1500);
     sendStatus('Unchecked Select All button.');
+
+    // Re-check the system instruction source if it got unchecked
+    const sysCb = getSystemInstructionCheckbox();
+    if (sysCb && !sysCb.checked) {
+      sysCb.click();
+      await wait(500);
+      sendStatus('Re-selected system instruction source.');
+    }
   } else {
     // Robust fallback: Find all individual source checkboxes and uncheck them
     const sourceCheckboxes = document.querySelectorAll('.single-source-container input[type="checkbox"]');
     if (sourceCheckboxes.length > 0) {
       let uncheckedCount = 0;
       sourceCheckboxes.forEach(cb => {
+        // Inspect the container text for this specific checkbox
+        let isSys = false;
+        let parent = cb.parentElement;
+        while (parent && parent !== document.body && !parent.classList.contains('single-source-container')) {
+          parent = parent.parentElement;
+        }
+        if (parent) {
+          const text = (parent.textContent || '').trim().toLowerCase();
+          if (isSystemInstructionTitle(text)) {
+            isSys = true;
+          }
+        }
+
         if (cb.checked) {
+          if (isSys) {
+            return; // Keep it checked, skip unchecking
+          }
           cb.click();
           uncheckedCount++;
+        } else if (isSys) {
+          // If the system instruction checkbox was unchecked, check it!
+          cb.click();
         }
       });
       if (uncheckedCount > 0) {
@@ -223,19 +310,7 @@
             [2, null, null, [1, null, null, null, null, null, null, null, null, null, [1]]]
           ];
 
-          const envelope = [RPC_REGISTER_FILES, JSON.stringify(payload), null, 'generic'];
-          const formData = new URLSearchParams();
-          formData.set('f.req', JSON.stringify([[envelope]]));
-          formData.set('at', wiz.at);
-
-          const reqId = generateReqId();
-          const url = `${NLM_API_BASE}?rpcids=${RPC_REGISTER_FILES}&_reqid=${reqId}&bl=${wiz.bl}&f.sid=${wiz.fSid}&hl=en&authuser=0&source-path=%2Fnotebook%2F${notebookId}`;
-
-          const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-            body: formData.toString()
-          });
+          const response = await callBatchExecute(RPC_REGISTER_FILES, payload, wiz, notebookId);
 
           if (!response.ok) {
             throw new Error(`${RPC_REGISTER_FILES} request failed with status: ${response.status}`);
