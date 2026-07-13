@@ -50,10 +50,10 @@
     if (!title) return false;
     const normalized = title.trim().toLowerCase();
     return normalized.includes('cq_checker_instruction') ||
-           normalized.includes('cq checker instruction') ||
-           normalized.includes('cq-checker-instruction') ||
-           normalized.includes('system_instruction') ||
-           normalized.includes('system instruction');
+      normalized.includes('cq checker instruction') ||
+      normalized.includes('cq-checker-instruction') ||
+      normalized.includes('system_instruction') ||
+      normalized.includes('system instruction');
   };
 
   const getSystemInstructionCheckbox = () => {
@@ -168,7 +168,7 @@
           if (response.ok) {
             sendStatus('System instructions synced successfully.');
             sessionStorage.setItem(syncKey, 'true');
-            
+
             const simpleHash = (str) => {
               let h = 0;
               for (let i = 0; i < str.length; i++) {
@@ -524,8 +524,8 @@
   }
 
   if (queryTextarea) {
-    sendStatus('Typing "Run" prompt...');
-    queryTextarea.value = 'Run';
+    sendStatus('Typing "Analyze supplier documents" prompt...');
+    queryTextarea.value = 'Analyze supplier documents';
     queryTextarea.dispatchEvent(new Event('input', { bubbles: true }));
     queryTextarea.dispatchEvent(new Event('change', { bubbles: true }));
     await wait(500);
