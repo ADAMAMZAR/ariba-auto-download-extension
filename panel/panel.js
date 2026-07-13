@@ -119,7 +119,6 @@ document.addEventListener('DOMContentLoaded', () => {
           // Always clear state so every button click starts fresh
           window.__aribaAutomationRunning = false;
           window.__aribaStop = false;
-          window.hasAribaToastListener = false;
           window.__aribaContentVersion = version;
         },
         args: [currentVersion]
