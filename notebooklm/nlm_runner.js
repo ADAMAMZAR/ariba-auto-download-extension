@@ -524,8 +524,9 @@
   }
 
   if (queryTextarea) {
-    sendStatus('Typing "Analyze supplier documents" prompt...');
-    queryTextarea.value = 'Analyze supplier documents';
+    sendStatus('Typing prompt...');
+    const fileNames = filesToUpload ? filesToUpload.map(f => `"${f.filename}"`).join(', ') : '';
+    queryTextarea.value = `Analyze the following supplier documents: ${fileNames}\n\n(CRITICAL: Do not output any internal reasoning or step-by-step logic. Output only the final formatted answer.)`;
     queryTextarea.dispatchEvent(new Event('input', { bubbles: true }));
     queryTextarea.dispatchEvent(new Event('change', { bubbles: true }));
     await wait(500);

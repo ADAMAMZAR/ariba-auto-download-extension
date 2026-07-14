@@ -1146,12 +1146,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               } else {
                 // ── Non-PDF file: original behaviour unchanged ───────────────
                 if (nlmEnabled) {
-                  dataUrl = await blobToDataUrl(blob);
-                  filesForNotebook.push({
-                    filename: `${s} - ${cleanName(realFilename)}`,
-                    dataUrl,
-                    mimeType
-                  });
+                  const ext = realFilename.split('.').pop().toLowerCase();
+                  if (ext !== 'mhtml' && ext !== 'mht') {
+                    dataUrl = await blobToDataUrl(blob);
+                    filesForNotebook.push({
+                      filename: `${s} - ${cleanName(realFilename)}`,
+                      dataUrl,
+                      mimeType
+                    });
+                  } else {
+                    notifyAribaTab(tabId, `Skipped uploading "${realFilename}" to NotebookLM (unsupported format).`, true);
+                    notifyPanel(`Skipped "${realFilename}" upload to NotebookLM (unsupported format).`, true);
+                  }
                 }
               }
 
