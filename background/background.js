@@ -516,7 +516,7 @@ async function reportEvent(type, details = {}) {
   return entry;
 }
 
-async function performDriveOcrViaAppsScript(filename, base64Data, mimeType) {
+async function performDriveOcrViaAppsScript(filename, base64Data, mimeType, localText = '') {
   if (!TELEMETRY_ENDPOINT) {
     throw new Error('Google Apps Script endpoint is not configured in constants.js');
   }
@@ -525,7 +525,8 @@ async function performDriveOcrViaAppsScript(filename, base64Data, mimeType) {
     action: 'ocr',
     filename: filename,
     fileBase64: base64Data,
-    mimeType: mimeType
+    mimeType: mimeType,
+    text: localText
   };
 
   const response = await fetch(TELEMETRY_ENDPOINT, {
@@ -543,7 +544,23 @@ async function performDriveOcrViaAppsScript(filename, base64Data, mimeType) {
     throw new Error(result.error || 'Unknown error occurred in Apps Script OCR');
   }
 
-  return result.text;
+  return {
+    text: result.text || '',
+    extraction: result.extraction || null
+  };
+}
+
+function formatExtractionBlock(filename, extraction, rawText) {
+  let block = `Supplier Name: ${extraction?.supplierName || 'Not Found'}\n`;
+  block += `Issuer Name: ${extraction?.issuerName || 'Not Found'}\n`;
+  block += `Year of Publication: ${extraction?.yearOfPublication || 'Not Found'}\n`;
+  block += `Certificate Number: ${extraction?.certificateNumber || 'Not Found'}\n`;
+  block += `Effective Date: ${extraction?.effectiveDate || 'Not Found'}\n`;
+  block += `Expiration Date: ${extraction?.expirationDate || 'Not Found'}\n`;
+  block += `Amount: ${extraction?.amount || 'Not Found / Not Applicable'}\n\n`;
+  block += `--- RAW TEXT ---\n`;
+  block += rawText || '';
+  return block;
 }
 
 function cleanName(n) {
@@ -1133,10 +1150,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       });
                       if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                      compiledTextList.push({
-                        filename: realFilename,
-                        text: text
-                      });
+                      notifyAribaTab(tabId, `Extracting entities from "${realFilename}" (cached)...`);
+                      try {
+                        const ocrResult = await performDriveOcrViaAppsScript(realFilename, '', mimeType, text);
+                        const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, text);
+                        compiledTextList.push({
+                          filename: realFilename,
+                          text: formattedText
+                        });
+                      } catch (ocrErr) {
+                        console.error('[Ariba Ext] Cached entity extraction failed:', ocrErr);
+                        compiledTextList.push({
+                          filename: realFilename,
+                          text: formatExtractionBlock(realFilename, null, text)
+                        });
+                      }
                     }
                   } else {
                     // Not in cache, perform fresh text extraction
@@ -1172,17 +1200,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       });
                       if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                      compiledTextList.push({
-                        filename: realFilename,
-                        text: text
-                      });
+                      notifyAribaTab(tabId, `Extracting entities from "${realFilename}"...`);
+                      try {
+                        const ocrResult = await performDriveOcrViaAppsScript(realFilename, '', mimeType, text);
+                        const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, text);
+                        compiledTextList.push({
+                          filename: realFilename,
+                          text: formattedText
+                        });
+                      } catch (ocrErr) {
+                        console.error('[Ariba Ext] Entity extraction failed:', ocrErr);
+                        notifyAribaTab(tabId, `Entity extraction failed for "${realFilename}": ${ocrErr.message}`, true);
+                        compiledTextList.push({
+                          filename: realFilename,
+                          text: formatExtractionBlock(realFilename, null, text)
+                        });
+                      }
 
                     } else {
-                      // ── Scanned PDF: Call Drive OCR via Apps Script ────
-                      notifyAribaTab(tabId, `"${realFilename}" is scanned. Running remote Drive OCR...`);
+                      // ── Scanned PDF: Call Drive OCR & Entity Extraction via Apps Script ────
+                      notifyAribaTab(tabId, `"${realFilename}" is scanned. Running remote Drive OCR & Entity Extraction...`);
                       try {
                         const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
-                        const ocrText = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
+                        const ocrResult = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
+                        const ocrText = ocrResult.text;
 
                         // Cache it
                         await setCachedPdfText(fileHash, { text: ocrText, isScanned: true, isPasswordProtected: false });
@@ -1207,9 +1248,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         });
                         if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
+                        const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, ocrText);
                         compiledTextList.push({
                           filename: realFilename,
-                          text: ocrText
+                          text: formattedText
                         });
                       } catch (ocrErr) {
                         console.error('[Ariba Ext] Remote OCR failed:', ocrErr);
@@ -1236,10 +1278,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 // ── Non-PDF file: check if image ───────────────
                 const isImage = mimeType.includes('image') || /\.(png|jpe?g)$/i.test(realFilename);
                 if (isImage) {
-                  notifyAribaTab(tabId, `"${realFilename}" is an image. Running remote Drive OCR...`);
+                  notifyAribaTab(tabId, `"${realFilename}" is an image. Running remote Drive OCR & Entity Extraction...`);
                   try {
                     const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
-                    const ocrText = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
+                    const ocrResult = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
+                    const ocrText = ocrResult.text;
 
                     // Save .txt alongside original image on disk
                     const txtFilename = realFilename.replace(/\.(png|jpe?g)$/i, '.txt');
@@ -1260,9 +1303,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     });
                     if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
+                    const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, ocrText);
                     compiledTextList.push({
                       filename: realFilename,
-                      text: ocrText
+                      text: formattedText
                     });
                   } catch (ocrErr) {
                     console.error('[Ariba Ext] Image OCR failed:', ocrErr);
