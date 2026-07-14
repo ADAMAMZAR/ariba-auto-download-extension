@@ -563,6 +563,33 @@ function formatExtractionBlock(filename, extraction, rawText) {
   return block;
 }
 
+async function saveMetadataJsonToDisk(s, realFilename, extraction) {
+  if (!extraction) return null;
+  try {
+    const jsonStr = JSON.stringify(extraction, null, 2);
+    const utf8Bytes = new TextEncoder().encode(jsonStr);
+    const base64 = uint8ArrayToBase64(utf8Bytes);
+    const metaDataUrl = `data:application/json;charset=utf-8;base64,${base64}`;
+
+    const metaFilename = realFilename.replace(/\.[a-z0-9]+$/i, '_metadata.json');
+    const destMetaFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(metaFilename)}`;
+    
+    const metaDownloadId = await new Promise((resolve) => {
+      chrome.downloads.download({ url: metaDataUrl, filename: destMetaFilename, saveAs: false }, (dlId) => {
+        if (chrome.runtime.lastError || dlId === undefined) {
+          resolve(null);
+        } else {
+          resolve(dlId);
+        }
+      });
+    });
+    return metaDownloadId;
+  } catch (err) {
+    console.error('[Ariba Ext] Failed to save metadata JSON for', realFilename, err);
+    return null;
+  }
+}
+
 function cleanName(n) {
   // Rules are defined in shared/constants.js (SUPPLIER_CLEAN_RULES) so that
   // this function and sanitiseSupplierName() in content.js always stay in sync.
@@ -1017,6 +1044,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const diskDownloadIds = [];
           const filesForNotebook = [];
           const compiledTextList = [];
+          const compiledExtractionList = [];
           const usedFilenames = new Set(); // Track filenames to guarantee uniqueness
           const seenHashes = new Map(); // hash -> filename, to skip byte-identical duplicate files this run
 
@@ -1158,6 +1186,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                           filename: realFilename,
                           text: formattedText
                         });
+                        if (ocrResult.extraction) {
+                          compiledExtractionList.push({
+                            filename: realFilename,
+                            metadata: ocrResult.extraction
+                          });
+                          const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
+                          if (metaDlId != null) diskDownloadIds.push(metaDlId);
+                        }
                       } catch (ocrErr) {
                         console.error('[Ariba Ext] Cached entity extraction failed:', ocrErr);
                         compiledTextList.push({
@@ -1208,6 +1244,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                           filename: realFilename,
                           text: formattedText
                         });
+                        if (ocrResult.extraction) {
+                          compiledExtractionList.push({
+                            filename: realFilename,
+                            metadata: ocrResult.extraction
+                          });
+                          const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
+                          if (metaDlId != null) diskDownloadIds.push(metaDlId);
+                        }
                       } catch (ocrErr) {
                         console.error('[Ariba Ext] Entity extraction failed:', ocrErr);
                         notifyAribaTab(tabId, `Entity extraction failed for "${realFilename}": ${ocrErr.message}`, true);
@@ -1253,6 +1297,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                           filename: realFilename,
                           text: formattedText
                         });
+                        if (ocrResult.extraction) {
+                          compiledExtractionList.push({
+                            filename: realFilename,
+                            metadata: ocrResult.extraction
+                          });
+                          const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
+                          if (metaDlId != null) diskDownloadIds.push(metaDlId);
+                        }
                       } catch (ocrErr) {
                         console.error('[Ariba Ext] Remote OCR failed:', ocrErr);
                         notifyAribaTab(tabId, `Remote OCR failed for "${realFilename}": ${ocrErr.message}`, true);
@@ -1308,6 +1360,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       filename: realFilename,
                       text: formattedText
                     });
+                    if (ocrResult.extraction) {
+                      compiledExtractionList.push({
+                        filename: realFilename,
+                        metadata: ocrResult.extraction
+                      });
+                      const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
+                      if (metaDlId != null) diskDownloadIds.push(metaDlId);
+                    }
                   } catch (ocrErr) {
                     console.error('[Ariba Ext] Image OCR failed:', ocrErr);
                     notifyAribaTab(tabId, `Image OCR failed for "${realFilename}": ${ocrErr.message}`, true);
@@ -1396,6 +1456,38 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (firstFatalError) throw firstFatalError;
 
           if (stopSignal.aborted) throw new Error('Stopped by user.');
+
+          if (compiledExtractionList.length > 0) {
+            notifyAribaTab(tabId, 'Saving consolidated metadata JSON...');
+            try {
+              compiledExtractionList.sort((a, b) => a.filename.localeCompare(b.filename));
+
+              const consolidatedJson = JSON.stringify(compiledExtractionList, null, 2);
+              const utf8BytesConsolidated = new TextEncoder().encode(consolidatedJson);
+              const base64Consolidated = uint8ArrayToBase64(utf8BytesConsolidated);
+              const consolidatedDataUrl = `data:application/json;charset=utf-8;base64,${base64Consolidated}`;
+
+              const consolidatedFilename = `${s} - Extracted_Metadata.json`;
+              const destConsolidatedFilename = `${DOWNLOAD_ROOT}/${s}/${consolidatedFilename}`;
+              
+              const consolidatedDownloadId = await new Promise((resolve) => {
+                chrome.downloads.download({
+                  url: consolidatedDataUrl,
+                  filename: destConsolidatedFilename,
+                  saveAs: false
+                }, (dlId) => {
+                  if (chrome.runtime.lastError || dlId === undefined) {
+                    resolve(null);
+                  } else {
+                    resolve(dlId);
+                  }
+                });
+              });
+              if (consolidatedDownloadId != null) diskDownloadIds.push(consolidatedDownloadId);
+            } catch (err) {
+              console.error('[Ariba Ext] Failed to save consolidated metadata JSON:', err);
+            }
+          }
 
           if (nlmEnabled && compiledTextList.length > 0) {
             notifyAribaTab(tabId, 'Compiling extracted texts into single document...');
