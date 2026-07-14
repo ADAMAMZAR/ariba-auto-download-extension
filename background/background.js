@@ -516,6 +516,36 @@ async function reportEvent(type, details = {}) {
   return entry;
 }
 
+async function performDriveOcrViaAppsScript(filename, base64Data, mimeType) {
+  if (!TELEMETRY_ENDPOINT) {
+    throw new Error('Google Apps Script endpoint is not configured in constants.js');
+  }
+
+  const payload = {
+    action: 'ocr',
+    filename: filename,
+    fileBase64: base64Data,
+    mimeType: mimeType
+  };
+
+  const response = await fetch(TELEMETRY_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Apps Script returned HTTP ${response.status}: ${response.statusText}`);
+  }
+
+  const result = await response.json();
+  if (!result.ok) {
+    throw new Error(result.error || 'Unknown error occurred in Apps Script OCR');
+  }
+
+  return result.text;
+}
+
 function cleanName(n) {
   // Rules are defined in shared/constants.js (SUPPLIER_CLEAN_RULES) so that
   // this function and sanitiseSupplierName() in content.js always stay in sync.
@@ -969,6 +999,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const files = request.files || [];
           const diskDownloadIds = [];
           const filesForNotebook = [];
+          const compiledTextList = [];
           const usedFilenames = new Set(); // Track filenames to guarantee uniqueness
           const seenHashes = new Map(); // hash -> filename, to skip byte-identical duplicate files this run
 
@@ -1071,31 +1102,157 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                   let text, isScanned, isPasswordProtected;
                   if (cachedExtraction) {
                     ({ text, isScanned, isPasswordProtected } = cachedExtraction);
-                    notifyAribaTab(tabId, `Using cached extraction for "${realFilename}" (seen before).`);
-                  } else {
-                    ({ text, isScanned, isPasswordProtected } = await extractTextFromPdfBuffer(arrayBuf));
                   }
 
-                  if (isPasswordProtected) {
-                    notifyAribaTab(tabId, `Skipped uploading "${realFilename}" to NotebookLM (password protected).`, true);
-                    notifyPanel(`Skipped NotebookLM upload for "${realFilename}" (password protected).`, true);
-                  } else if (!isScanned) {
-                    // ── Scanned OK: save .txt to disk + send .txt to NLM ────
-                    if (!cachedExtraction) await setCachedPdfText(fileHash, { text, isScanned: false, isPasswordProtected: false });
-                    const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
-                    const txtDataUrl = textToDataUrl(text);
+                  // If we have cached extraction, process immediately
+                  if (cachedExtraction && text) {
+                    if (isPasswordProtected) {
+                      notifyAribaTab(tabId, `Skipped processing "${realFilename}" (password protected).`, true);
+                      compiledTextList.push({
+                        filename: realFilename,
+                        text: `[DECRYPTION_BLOCKED] Password protected PDF.`
+                      });
+                    } else {
+                      notifyAribaTab(tabId, `Using cached extraction for "${realFilename}" (seen before).`);
+                      const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
+                      const txtDataUrl = textToDataUrl(text);
 
-                    // Save .txt alongside original PDF on disk
+                      // Save .txt alongside original PDF on disk
+                      const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
+                      const txtDownloadId = await new Promise((resolve) => {
+                        chrome.downloads.download(
+                          { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
+                          (dlId) => {
+                            if (chrome.runtime.lastError || dlId === undefined) {
+                              resolve(null);
+                            } else {
+                              resolve(dlId);
+                            }
+                          }
+                        );
+                      });
+                      if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
+
+                      compiledTextList.push({
+                        filename: realFilename,
+                        text: text
+                      });
+                    }
+                  } else {
+                    // Not in cache, perform fresh text extraction
+                    ({ text, isScanned, isPasswordProtected } = await extractTextFromPdfBuffer(arrayBuf));
+
+                    if (isPasswordProtected) {
+                      notifyAribaTab(tabId, `Skipped processing "${realFilename}" (password protected).`, true);
+                      compiledTextList.push({
+                        filename: realFilename,
+                        text: `[DECRYPTION_BLOCKED] Password protected PDF.`
+                      });
+                    } else if (!isScanned) {
+                      // ── Digital PDF: save .txt to disk + add to compilation ────
+                      await setCachedPdfText(fileHash, { text, isScanned: false, isPasswordProtected: false });
+                      const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
+                      const txtDataUrl = textToDataUrl(text);
+
+                      // Save .txt alongside original PDF on disk
+                      const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
+                      const txtDownloadId = await new Promise((resolve) => {
+                        chrome.downloads.download(
+                          { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
+                          (dlId) => {
+                            if (chrome.runtime.lastError || dlId === undefined) {
+                              notifyAribaTab(tabId, `TXT save failed for "${txtFilename}"`, true);
+                              resolve(null);
+                            } else {
+                              notifyAribaTab(tabId, `Saved TXT → ${destTxtFilename}`);
+                              resolve(dlId);
+                            }
+                          }
+                        );
+                      });
+                      if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
+
+                      compiledTextList.push({
+                        filename: realFilename,
+                        text: text
+                      });
+
+                    } else {
+                      // ── Scanned PDF: Call Drive OCR via Apps Script ────
+                      notifyAribaTab(tabId, `"${realFilename}" is scanned. Running remote Drive OCR...`);
+                      try {
+                        const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
+                        const ocrText = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
+
+                        // Cache it
+                        await setCachedPdfText(fileHash, { text: ocrText, isScanned: true, isPasswordProtected: false });
+
+                        // Save .txt alongside original PDF on disk
+                        const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
+                        const txtDataUrl = textToDataUrl(ocrText);
+                        const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
+                        const txtDownloadId = await new Promise((resolve) => {
+                          chrome.downloads.download(
+                            { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
+                            (dlId) => {
+                              if (chrome.runtime.lastError || dlId === undefined) {
+                                notifyAribaTab(tabId, `TXT (OCR) save failed for "${txtFilename}"`, true);
+                                resolve(null);
+                              } else {
+                                notifyAribaTab(tabId, `Saved TXT (OCR) → ${destTxtFilename}`);
+                                resolve(dlId);
+                              }
+                            }
+                          );
+                        });
+                        if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
+
+                        compiledTextList.push({
+                          filename: realFilename,
+                          text: ocrText
+                        });
+                      } catch (ocrErr) {
+                        console.error('[Ariba Ext] Remote OCR failed:', ocrErr);
+                        notifyAribaTab(tabId, `Remote OCR failed for "${realFilename}": ${ocrErr.message}`, true);
+                        compiledTextList.push({
+                          filename: realFilename,
+                          text: `[OCR_FAILED] Remote OCR failed: ${ocrErr.message}`
+                        });
+                      }
+                    }
+                  }
+
+                } catch (pdfErr) {
+                  // Extraction failed unexpectedly
+                  console.error('[Ariba Ext] Local extraction error:', pdfErr);
+                  notifyAribaTab(tabId, `Text extraction failed for "${realFilename}": ${pdfErr.message}`, true);
+                  compiledTextList.push({
+                    filename: realFilename,
+                    text: `[EXTRACTION_FAILED] Local extraction failed: ${pdfErr.message}`
+                  });
+                }
+
+              } else {
+                // ── Non-PDF file: check if image ───────────────
+                const isImage = mimeType.includes('image') || /\.(png|jpe?g)$/i.test(realFilename);
+                if (isImage) {
+                  notifyAribaTab(tabId, `"${realFilename}" is an image. Running remote Drive OCR...`);
+                  try {
+                    const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
+                    const ocrText = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
+
+                    // Save .txt alongside original image on disk
+                    const txtFilename = realFilename.replace(/\.(png|jpe?g)$/i, '.txt');
+                    const txtDataUrl = textToDataUrl(ocrText);
                     const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
                     const txtDownloadId = await new Promise((resolve) => {
                       chrome.downloads.download(
                         { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
                         (dlId) => {
                           if (chrome.runtime.lastError || dlId === undefined) {
-                            notifyAribaTab(tabId, `TXT save failed for "${txtFilename}"`, true);
                             resolve(null);
                           } else {
-                            notifyAribaTab(tabId, `Saved TXT → ${destTxtFilename}`);
+                            notifyAribaTab(tabId, `Saved TXT (OCR) → ${destTxtFilename}`);
                             resolve(dlId);
                           }
                         }
@@ -1103,61 +1260,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     });
                     if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                    // Send .txt (not the PDF) to NotebookLM
-                    if (nlmEnabled) {
-                      filesForNotebook.push({
-                        filename: `${s} - ${cleanName(txtFilename)}`,
-                        dataUrl: txtDataUrl,
-                        mimeType: 'text/plain'
-                      });
-                    }
-
-                  } else {
-                    // ── Scanned / garbled: no readable text layer — fall back to PDF ────
-                    notifyAribaTab(tabId,
-                      `"${realFilename}" has no text layer (scanned image). ` +
-                      `Uploading original PDF to NotebookLM as fallback.`, true);
-                    if (nlmEnabled) {
-                      dataUrl = await blobToDataUrl(blob);
-                      filesForNotebook.push({
-                        filename: `${s} - ${cleanName(realFilename)}`,
-                        dataUrl,
-                        mimeType
-                      });
-                    }
-
-                  }
-
-                } catch (pdfErr) {
-                  // Extraction failed unexpectedly — fall back to original PDF
-                  notifyAribaTab(tabId,
-                    `TXT extraction failed for "${realFilename}": ${pdfErr.message}. ` +
-                    `Using original PDF.`, true);
-                  if (nlmEnabled) {
-                    dataUrl = await blobToDataUrl(blob);
-                    filesForNotebook.push({
-                      filename: `${s} - ${cleanName(realFilename)}`,
-                      dataUrl,
-                      mimeType
+                    compiledTextList.push({
+                      filename: realFilename,
+                      text: ocrText
+                    });
+                  } catch (ocrErr) {
+                    console.error('[Ariba Ext] Image OCR failed:', ocrErr);
+                    notifyAribaTab(tabId, `Image OCR failed for "${realFilename}": ${ocrErr.message}`, true);
+                    compiledTextList.push({
+                      filename: realFilename,
+                      text: `[OCR_FAILED] Image OCR failed: ${ocrErr.message}`
                     });
                   }
-                }
-
-              } else {
-                // ── Non-PDF file: original behaviour unchanged ───────────────
-                if (nlmEnabled) {
-                  const ext = realFilename.split('.').pop().toLowerCase();
-                  if (ext !== 'mhtml' && ext !== 'mht') {
-                    dataUrl = await blobToDataUrl(blob);
-                    filesForNotebook.push({
-                      filename: `${s} - ${cleanName(realFilename)}`,
-                      dataUrl,
-                      mimeType
-                    });
-                  } else {
-                    notifyAribaTab(tabId, `Skipped uploading "${realFilename}" to NotebookLM (unsupported format).`, true);
-                    notifyPanel(`Skipped "${realFilename}" upload to NotebookLM (unsupported format).`, true);
-                  }
+                } else {
+                  // Non-image, non-PDF file
+                  notifyAribaTab(tabId, `Skipped text extraction for "${realFilename}" (unsupported format).`, true);
+                  compiledTextList.push({
+                    filename: realFilename,
+                    text: `[TEXT_EXTRACTION_UNSUPPORTED] File type: ${mimeType}`
+                  });
                 }
               }
 
@@ -1231,6 +1352,31 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (firstFatalError) throw firstFatalError;
 
           if (stopSignal.aborted) throw new Error('Stopped by user.');
+
+          if (nlmEnabled && compiledTextList.length > 0) {
+            notifyAribaTab(tabId, 'Compiling extracted texts into single document...');
+            let compiledString = '';
+
+            // Sort by filename for deterministic order
+            compiledTextList.sort((a, b) => a.filename.localeCompare(b.filename));
+
+            compiledTextList.forEach(item => {
+              compiledString += `=========================================\n`;
+              compiledString += `FILE: ${item.filename}\n`;
+              compiledString += `=========================================\n\n`;
+              compiledString += `${item.text}\n\n\n`;
+            });
+
+            const utf8BytesCompiled = new TextEncoder().encode(compiledString);
+            const base64Compiled = uint8ArrayToBase64(utf8BytesCompiled);
+            const compiledDataUrl = `data:text/plain;charset=utf-8;base64,${base64Compiled}`;
+
+            filesForNotebook.push({
+              filename: `${s} - Extracted_Data.txt`,
+              dataUrl: compiledDataUrl,
+              mimeType: 'text/plain'
+            });
+          }
 
           if (request.extractedQAData && request.extractedQAData.length > 0) {
             notifyAribaTab(tabId, 'Generating QA markdown document...');
