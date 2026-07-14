@@ -55,7 +55,7 @@ var UPLOAD_BATCH_SIZE = 5;
 // telemetry/apps_script.gs + telemetry/SETUP.md for how to deploy one).
 // Leave blank to disable remote reporting — errors are still kept in the
 // local ring buffer (chrome.storage.local key TELEMETRY_LOG_KEY) either way.
-var TELEMETRY_ENDPOINT = 'https://script.google.com/a/macros/gamuda.com.my/s/AKfycby9k__kkKNqrdP2HoaIraPF0CFqzvns5odOGUOdk7tI9HdJUxr8898htQ6yA1bu4hiB/exec';
+var TELEMETRY_ENDPOINT = 'https://script.google.com/a/macros/gamuda.com.my/s/AKfycbzIHR1S1_sYuS5RnFviPwflUa2uqd5UrLm9IL64g_NvjoKWtUAmC87-qinkUHuigMjj/exec';
 
 // Local ring-buffer settings (chrome.storage.local)
 var TELEMETRY_LOG_KEY = 'debugLog';
@@ -74,12 +74,12 @@ var TELEMETRY_LOG_MAX = 50;
 //     on disk. The PTY LTD negative-lookahead rule prevents swallowing a
 //     trailing dot that is actually part of a file extension.
 var SUPPLIER_CLEAN_RULES = [
-  [/["']/g,                                             ''],    // strip quotes entirely
-  [/PTY LIMITED/gi,                                     'P/L'],
-  [/PTY LTD\.(?!pdf|docx?|xlsx?|txt|jpe?g|png)/gi,     'P/L'], // PTY LTD. not before an extension
-  [/PTY LTD/gi,                                         'P/L'],
-  [/The trustee of\s+/gi,                               'TOF '],
-  [/The trustee for\s+/gi,                              'TOF '],
-  [/[\/\\?%*:|<>]/g,                                    '-'],   // illegal filesystem chars → dash
-  [/\.+$/,                                              ''],    // Windows: no trailing periods
+  [/["']/g, ''],    // strip quotes entirely
+  [/PTY LIMITED/gi, 'P/L'],
+  [/PTY LTD\.(?!pdf|docx?|xlsx?|txt|jpe?g|png)/gi, 'P/L'], // PTY LTD. not before an extension
+  [/PTY LTD/gi, 'P/L'],
+  [/The trustee of\s+/gi, 'TOF '],
+  [/The trustee for\s+/gi, 'TOF '],
+  [/[\/\\?%*:|<>]/g, '-'],   // illegal filesystem chars → dash
+  [/\.+$/, ''],    // Windows: no trailing periods
 ];

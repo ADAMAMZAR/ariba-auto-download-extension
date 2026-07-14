@@ -545,49 +545,14 @@ async function performDriveOcrViaAppsScript(filename, base64Data, mimeType, loca
   }
 
   return {
-    text: result.text || '',
-    extraction: result.extraction || null
+    text: result.text || ''
   };
 }
 
-function formatExtractionBlock(filename, extraction, rawText) {
-  let block = `Supplier Name: ${extraction?.supplierName || 'Not Found'}\n`;
-  block += `Issuer Name: ${extraction?.issuerName || 'Not Found'}\n`;
-  block += `Year of Publication: ${extraction?.yearOfPublication || 'Not Found'}\n`;
-  block += `Certificate Number: ${extraction?.certificateNumber || 'Not Found'}\n`;
-  block += `Effective Date: ${extraction?.effectiveDate || 'Not Found'}\n`;
-  block += `Expiration Date: ${extraction?.expirationDate || 'Not Found'}\n`;
-  block += `Amount: ${extraction?.amount || 'Not Found / Not Applicable'}\n\n`;
-  block += `--- RAW TEXT ---\n`;
+function formatTextBlock(filename, rawText) {
+  let block = `--- FILE: ${filename} ---\n`;
   block += rawText || '';
   return block;
-}
-
-async function saveMetadataJsonToDisk(s, realFilename, extraction) {
-  if (!extraction) return null;
-  try {
-    const jsonStr = JSON.stringify(extraction, null, 2);
-    const utf8Bytes = new TextEncoder().encode(jsonStr);
-    const base64 = uint8ArrayToBase64(utf8Bytes);
-    const metaDataUrl = `data:application/json;charset=utf-8;base64,${base64}`;
-
-    const metaFilename = realFilename.replace(/\.[a-z0-9]+$/i, '_metadata.json');
-    const destMetaFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(metaFilename)}`;
-    
-    const metaDownloadId = await new Promise((resolve) => {
-      chrome.downloads.download({ url: metaDataUrl, filename: destMetaFilename, saveAs: false }, (dlId) => {
-        if (chrome.runtime.lastError || dlId === undefined) {
-          resolve(null);
-        } else {
-          resolve(dlId);
-        }
-      });
-    });
-    return metaDownloadId;
-  } catch (err) {
-    console.error('[Ariba Ext] Failed to save metadata JSON for', realFilename, err);
-    return null;
-  }
 }
 
 function cleanName(n) {
@@ -1044,7 +1009,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const diskDownloadIds = [];
           const filesForNotebook = [];
           const compiledTextList = [];
-          const compiledExtractionList = [];
           const usedFilenames = new Set(); // Track filenames to guarantee uniqueness
           const seenHashes = new Map(); // hash -> filename, to skip byte-identical duplicate files this run
 
@@ -1178,29 +1142,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       });
                       if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                      notifyAribaTab(tabId, `Extracting entities from "${realFilename}" (cached)...`);
-                      try {
-                        const ocrResult = await performDriveOcrViaAppsScript(realFilename, '', mimeType, text);
-                        const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, text);
-                        compiledTextList.push({
-                          filename: realFilename,
-                          text: formattedText
-                        });
-                        if (ocrResult.extraction) {
-                          compiledExtractionList.push({
-                            filename: realFilename,
-                            metadata: ocrResult.extraction
-                          });
-                          const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
-                          if (metaDlId != null) diskDownloadIds.push(metaDlId);
-                        }
-                      } catch (ocrErr) {
-                        console.error('[Ariba Ext] Cached entity extraction failed:', ocrErr);
-                        compiledTextList.push({
-                          filename: realFilename,
-                          text: formatExtractionBlock(realFilename, null, text)
-                        });
-                      }
+                      const formattedText = formatTextBlock(realFilename, text);
+                      compiledTextList.push({
+                        filename: realFilename,
+                        text: formattedText
+                      });
                     }
                   } else {
                     // Not in cache, perform fresh text extraction
@@ -1236,34 +1182,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       });
                       if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                      notifyAribaTab(tabId, `Extracting entities from "${realFilename}"...`);
-                      try {
-                        const ocrResult = await performDriveOcrViaAppsScript(realFilename, '', mimeType, text);
-                        const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, text);
-                        compiledTextList.push({
-                          filename: realFilename,
-                          text: formattedText
-                        });
-                        if (ocrResult.extraction) {
-                          compiledExtractionList.push({
-                            filename: realFilename,
-                            metadata: ocrResult.extraction
-                          });
-                          const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
-                          if (metaDlId != null) diskDownloadIds.push(metaDlId);
-                        }
-                      } catch (ocrErr) {
-                        console.error('[Ariba Ext] Entity extraction failed:', ocrErr);
-                        notifyAribaTab(tabId, `Entity extraction failed for "${realFilename}": ${ocrErr.message}`, true);
-                        compiledTextList.push({
-                          filename: realFilename,
-                          text: formatExtractionBlock(realFilename, null, text)
-                        });
-                      }
+                      const formattedText = formatTextBlock(realFilename, text);
+                      compiledTextList.push({
+                        filename: realFilename,
+                        text: formattedText
+                      });
 
                     } else {
-                      // ── Scanned PDF: Call Drive OCR & Entity Extraction via Apps Script ────
-                      notifyAribaTab(tabId, `"${realFilename}" is scanned. Running remote Drive OCR & Entity Extraction...`);
+                      // ── Scanned PDF: Call Drive OCR via Apps Script ────
+                      notifyAribaTab(tabId, `"${realFilename}" is scanned. Running remote Drive OCR...`);
                       try {
                         const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
                         const ocrResult = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
@@ -1292,19 +1219,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         });
                         if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                        const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, ocrText);
+                        const formattedText = formatTextBlock(realFilename, ocrText);
                         compiledTextList.push({
                           filename: realFilename,
                           text: formattedText
                         });
-                        if (ocrResult.extraction) {
-                          compiledExtractionList.push({
-                            filename: realFilename,
-                            metadata: ocrResult.extraction
-                          });
-                          const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
-                          if (metaDlId != null) diskDownloadIds.push(metaDlId);
-                        }
                       } catch (ocrErr) {
                         console.error('[Ariba Ext] Remote OCR failed:', ocrErr);
                         notifyAribaTab(tabId, `Remote OCR failed for "${realFilename}": ${ocrErr.message}`, true);
@@ -1330,7 +1249,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 // ── Non-PDF file: check if image ───────────────
                 const isImage = mimeType.includes('image') || /\.(png|jpe?g)$/i.test(realFilename);
                 if (isImage) {
-                  notifyAribaTab(tabId, `"${realFilename}" is an image. Running remote Drive OCR & Entity Extraction...`);
+                  notifyAribaTab(tabId, `"${realFilename}" is an image. Running remote Drive OCR...`);
                   try {
                     const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
                     const ocrResult = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
@@ -1355,25 +1274,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     });
                     if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                    const formattedText = formatExtractionBlock(realFilename, ocrResult.extraction, ocrText);
+                    const formattedText = formatTextBlock(realFilename, ocrText);
                     compiledTextList.push({
                       filename: realFilename,
                       text: formattedText
                     });
-                    if (ocrResult.extraction) {
-                      compiledExtractionList.push({
-                        filename: realFilename,
-                        metadata: ocrResult.extraction
-                      });
-                      const metaDlId = await saveMetadataJsonToDisk(s, realFilename, ocrResult.extraction);
-                      if (metaDlId != null) diskDownloadIds.push(metaDlId);
-                    }
                   } catch (ocrErr) {
-                    console.error('[Ariba Ext] Image OCR failed:', ocrErr);
-                    notifyAribaTab(tabId, `Image OCR failed for "${realFilename}": ${ocrErr.message}`, true);
+                    console.error('[Ariba Ext] Remote OCR failed:', ocrErr);
+                    notifyAribaTab(tabId, `Remote OCR failed for "${realFilename}": ${ocrErr.message}`, true);
                     compiledTextList.push({
                       filename: realFilename,
-                      text: `[OCR_FAILED] Image OCR failed: ${ocrErr.message}`
+                      text: `[OCR_FAILED] Remote OCR failed: ${ocrErr.message}`
                     });
                   }
                 } else {
@@ -1457,39 +1368,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           if (stopSignal.aborted) throw new Error('Stopped by user.');
 
-          if (compiledExtractionList.length > 0) {
-            notifyAribaTab(tabId, 'Saving consolidated metadata JSON...');
-            try {
-              compiledExtractionList.sort((a, b) => a.filename.localeCompare(b.filename));
 
-              const consolidatedJson = JSON.stringify(compiledExtractionList, null, 2);
-              const utf8BytesConsolidated = new TextEncoder().encode(consolidatedJson);
-              const base64Consolidated = uint8ArrayToBase64(utf8BytesConsolidated);
-              const consolidatedDataUrl = `data:application/json;charset=utf-8;base64,${base64Consolidated}`;
 
-              const consolidatedFilename = `${s} - Extracted_Metadata.json`;
-              const destConsolidatedFilename = `${DOWNLOAD_ROOT}/${s}/${consolidatedFilename}`;
-              
-              const consolidatedDownloadId = await new Promise((resolve) => {
-                chrome.downloads.download({
-                  url: consolidatedDataUrl,
-                  filename: destConsolidatedFilename,
-                  saveAs: false
-                }, (dlId) => {
-                  if (chrome.runtime.lastError || dlId === undefined) {
-                    resolve(null);
-                  } else {
-                    resolve(dlId);
-                  }
-                });
-              });
-              if (consolidatedDownloadId != null) diskDownloadIds.push(consolidatedDownloadId);
-            } catch (err) {
-              console.error('[Ariba Ext] Failed to save consolidated metadata JSON:', err);
-            }
-          }
-
-          if (nlmEnabled && compiledTextList.length > 0) {
+          if (compiledTextList.length > 0) {
             notifyAribaTab(tabId, 'Compiling extracted texts into single document...');
             let compiledString = '';
 
@@ -1507,11 +1388,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const base64Compiled = uint8ArrayToBase64(utf8BytesCompiled);
             const compiledDataUrl = `data:text/plain;charset=utf-8;base64,${base64Compiled}`;
 
-            filesForNotebook.push({
-              filename: `${s} - Extracted_Data.txt`,
-              dataUrl: compiledDataUrl,
-              mimeType: 'text/plain'
+            const compiledFilename = `${s} - Extracted_Data.txt`;
+            if (nlmEnabled) {
+              filesForNotebook.push({
+                filename: compiledFilename,
+                dataUrl: compiledDataUrl,
+                mimeType: 'text/plain'
+              });
+            }
+
+            const destCompiledFilename = `${DOWNLOAD_ROOT}/${s}/${compiledFilename}`;
+            const compiledDownloadId = await new Promise((resolve) => {
+              chrome.downloads.download({
+                url: compiledDataUrl,
+                filename: destCompiledFilename,
+                saveAs: false
+              }, (dlId) => {
+                if (chrome.runtime.lastError || dlId === undefined) {
+                  notifyAribaTab(tabId, `Disk download failed for consolidated text document`, true);
+                  resolve(null);
+                } else {
+                  notifyAribaTab(tabId, `Saved consolidated text → ${destCompiledFilename}`);
+                  resolve(dlId);
+                }
+              });
             });
+            if (compiledDownloadId != null) {
+              diskDownloadIds.push(compiledDownloadId);
+            }
           }
 
           if (request.extractedQAData && request.extractedQAData.length > 0) {
@@ -1644,6 +1548,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // 'notebooklmConfig' and wrongly treat it as an active job on the
         // next update check (e.g. if Chrome was closed mid-run last time).
         chrome.storage.session.remove('notebooklmConfig').catch(() => { });
+
       }
     }
 

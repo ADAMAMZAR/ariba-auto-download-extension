@@ -1,5 +1,5 @@
 // ============================================================
-// Telemetry sink & Gemini extraction webhook for GPO extension.
+// Telemetry sink and Google Drive OCR webhook for GPO extension.
 //
 // Deploy this as a Google Apps Script Web App (see SETUP.md in this
 // folder), then paste the resulting /exec URL into
@@ -10,22 +10,19 @@
 // ============================================================
 
 const TELEMETRY_SHEET_NAME = 'Reports';
-const DATA_SHEET_NAME = 'ExtractedData';
 
 function doPost(e) {
   try {
     const payload = JSON.parse(e.postData.contents);
 
-    // Handle OCR & Gemini request
+    // Handle OCR request
     if (payload.action === 'ocr') {
       let text = payload.text || '';
       if (!text && payload.fileBase64) {
         text = runDriveOcr(payload.fileBase64, payload.filename, payload.mimeType);
       }
-      
-      const extractionResult = writeToSheetAndGetGeminiResult(payload.filename, text);
       return ContentService
-        .createTextOutput(JSON.stringify({ ok: true, text: text, extraction: extractionResult }))
+        .createTextOutput(JSON.stringify({ ok: true, text: text }))
         .setMimeType(ContentService.MimeType.JSON);
     }
 
@@ -58,127 +55,75 @@ function doPost(e) {
 }
 
 function runDriveOcr(base64Data, filename, mimeType) {
-  const blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType, filename);
-  const resource = {
-    title: 'Temp_OCR_' + filename,
-    mimeType: MimeType.GOOGLE_DOCS
+  const boundary = '-------314159265358979323846';
+  const delimiter = "\r\n--" + boundary + "\r\n";
+  const close_delim = "\r\n--" + boundary + "--";
+
+  const metadata = {
+    name: 'Temp_OCR_' + filename,
+    mimeType: 'application/vnd.google-apps.document'  // converting to Google Doc triggers OCR
   };
-  // Advanced Drive Service (v2) creates temporary document running OCR
-  const tempFile = Drive.Files.insert(resource, blob, { ocr: true, ocrLanguage: 'en' });
-  const doc = DocumentApp.openById(tempFile.id);
-  const text = doc.getBody().getText();
-  
-  // Delete temporary doc
-  Drive.Files.remove(tempFile.id);
-  
-  return text;
-}
 
-function writeToSheetAndGetGeminiResult(filename, rawText) {
-  const headers = [
-    'Received At', 'Filename', 'Raw Text', 'Gemini JSON Output',
-    'Supplier Name', 'Issuer Name', 'Year of Publication',
-    'Certificate Number', 'Effective Date', 'Expiration Date', 'Amount'
-  ];
-  const sheet = getOrCreateSheet(DATA_SHEET_NAME, headers);
-  const nextRow = sheet.getLastRow() + 1;
+  const multipartRequestBody =
+    delimiter +
+    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+    JSON.stringify(metadata) +
+    delimiter +
+    'Content-Type: ' + mimeType + '\r\n' +
+    'Content-Transfer-Encoding: base64\r\n\r\n' +
+    base64Data +
+    close_delim;
 
-  // Append raw text in Row first (Cols 1, 2, 3)
-  sheet.appendRow([
-    new Date(),
-    filename,
-    rawText
-  ]);
+  // Upload the file to Google Drive using the REST API
+  const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+  const response = UrlFetchApp.fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+      'Content-Type': 'multipart/related; boundary="' + boundary + '"'
+    },
+    payload: multipartRequestBody,
+    muteHttpExceptions: true
+  });
 
-  // Prompt that extracts target fields as JSON
-  const prompt = "Extract the following fields from the document text:\n" +
-    "1. Supplier Name (insured, policyholder, or vendor).\n" +
-    "2. Issuer Name (insurance company/broker or issuing authority).\n" +
-    "3. Year of Publication (year document was published/issued).\n" +
-    "4. Certificate Number (or policy number).\n" +
-    "5. Effective Date (policy start date, format: DD/MM/YYYY).\n" +
-    "6. Expiration Date (expiry date, format: DD/MM/YYYY).\n" +
-    "7. Amount (indemnity/liability limit or insured amount, ONLY if certificate type is Public Indemnity / Public Liability for Australia. Else null).\n\n" +
-    "Return strictly a JSON object with keys: supplierName, issuerName, yearOfPublication, certificateNumber, effectiveDate, expirationDate, amount.";
+  const respCode = response.getResponseCode();
+  const respText = response.getContentText();
 
-  // Write `=GEMINI(...)` formula in Column 4 (Col D)
-  // Double quotes inside prompt are escaped for Excel-like formula syntax
-  const escapedPrompt = prompt.replace(/"/g, '""');
-  sheet.getRange(nextRow, 4).setFormula(`=GEMINI("${escapedPrompt} Text: " & C${nextRow})`);
-
-  // Write `=GET_JSON_FIELD` formulas in Columns 5 to 11 (Col E to K)
-  sheet.getRange(nextRow, 5).setFormula(`=GET_JSON_FIELD(D${nextRow}, "supplierName")`);
-  sheet.getRange(nextRow, 6).setFormula(`=GET_JSON_FIELD(D${nextRow}, "issuerName")`);
-  sheet.getRange(nextRow, 7).setFormula(`=GET_JSON_FIELD(D${nextRow}, "yearOfPublication")`);
-  sheet.getRange(nextRow, 8).setFormula(`=GET_JSON_FIELD(D${nextRow}, "certificateNumber")`);
-  sheet.getRange(nextRow, 9).setFormula(`=GET_JSON_FIELD(D${nextRow}, "effectiveDate")`);
-  sheet.getRange(nextRow, 10).setFormula(`=GET_JSON_FIELD(D${nextRow}, "expirationDate")`);
-  sheet.getRange(nextRow, 11).setFormula(`=GET_JSON_FIELD(D${nextRow}, "amount")`);
-
-  SpreadsheetApp.flush();
-
-  // Poll Column D to evaluate (up to 20 seconds)
-  const startTime = new Date().getTime();
-  const maxWaitTimeMs = 20000;
-  let geminiResultStr = "";
-
-  while (new Date().getTime() - startTime < maxWaitTimeMs) {
-    Utilities.sleep(1000);
-    SpreadsheetApp.flush();
-    const cellValue = sheet.getRange(nextRow, 4).getValue();
-    const cellStr = String(cellValue).trim();
-    if (cellStr && !cellStr.startsWith('#') && !cellStr.toLowerCase().includes('loading')) {
-      geminiResultStr = cellStr;
-      break;
-    }
+  if (respCode !== 200) {
+    throw new Error('Drive API Upload failed (' + respCode + '): ' + respText);
   }
 
-  if (!geminiResultStr) {
-    return {
-      supplierName: "Timed out / Pending in Sheet",
-      issuerName: "Timed out",
-      yearOfPublication: "",
-      certificateNumber: "",
-      effectiveDate: "",
-      expirationDate: "",
-      amount: ""
-    };
+  const fileInfo = JSON.parse(respText);
+  const fileId = fileInfo.id;
+
+  // Retrieve the OCR-ed text using Drive export
+  const exportUrl = 'https://www.googleapis.com/drive/v3/files/' + fileId + '/export?mimeType=text%2Fplain';
+  const docResponse = UrlFetchApp.fetch(exportUrl, {
+    method: 'GET',
+    headers: {
+      'Authorization': 'Bearer ' + ScriptApp.getOAuthToken()
+    },
+    muteHttpExceptions: true
+  });
+
+  const docCode = docResponse.getResponseCode();
+  const docText = docResponse.getContentText();
+
+  // Delete the temporary file from Google Drive
+  const deleteUrl = 'https://www.googleapis.com/drive/v3/files/' + fileId;
+  UrlFetchApp.fetch(deleteUrl, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': 'Bearer ' + ScriptApp.getOAuthToken()
+    },
+    muteHttpExceptions: true
+  });
+
+  if (docCode !== 200) {
+    throw new Error('Failed to retrieve OCR text (' + docCode + '): ' + docText);
   }
 
-  try {
-    // Attempt to clean JSON block format (```json ... ```) if Gemini returns it
-    let cleanJson = geminiResultStr;
-    const jsonStart = cleanJson.indexOf('{');
-    const jsonEnd = cleanJson.lastIndexOf('}');
-    if (jsonStart !== -1 && jsonEnd !== -1) {
-      cleanJson = cleanJson.substring(jsonStart, jsonEnd + 1);
-    }
-    return JSON.parse(cleanJson);
-  } catch (e) {
-    return {
-      supplierName: "Parsing Error",
-      rawResult: geminiResultStr
-    };
-  }
-}
-
-// Custom Spreadsheet Function: Parses specific key from JSON string
-function GET_JSON_FIELD(jsonStr, field) {
-  if (!jsonStr) return "";
-  try {
-    // Clean codeblock markdown format if returned
-    let cleanJson = String(jsonStr).trim();
-    const jsonStart = cleanJson.indexOf('{');
-    const jsonEnd = cleanJson.lastIndexOf('}');
-    if (jsonStart !== -1 && jsonEnd !== -1) {
-      cleanJson = cleanJson.substring(jsonStart, jsonEnd + 1);
-    }
-    const obj = JSON.parse(cleanJson);
-    const val = obj[field];
-    return val !== undefined && val !== null ? val : "";
-  } catch (e) {
-    return "";
-  }
+  return docText;
 }
 
 function getOrCreateSheet(sheetName, headers) {
@@ -186,8 +131,17 @@ function getOrCreateSheet(sheetName, headers) {
   let sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     sheet = ss.insertSheet(sheetName);
-    sheet.appendRow(headers);
+    if (headers && headers.length > 0) {
+      sheet.appendRow(headers);
+    }
     sheet.setFrozenRows(1);
   }
   return sheet;
+}
+
+// Force Google Apps Script static analyzer to request Drive and UrlFetch OAuth scopes
+function authorizeService() {
+  DriveApp.getRootFolder();
+  UrlFetchApp.fetch("https://www.google.com", { muteHttpExceptions: true });
+  Logger.log("Authorization successful! You can now deploy the web app.");
 }
