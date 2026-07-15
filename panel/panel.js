@@ -85,6 +85,29 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.local.set({ deleteAfterUpload: deleteAfterUploadCheckbox.checked });
   });
 
+  const clearCacheBtn = document.getElementById('clear-cache-btn');
+  if (clearCacheBtn) {
+    clearCacheBtn.addEventListener('click', async () => {
+      clearCacheBtn.disabled = true;
+      try {
+        const keys = await chrome.storage.local.get(null);
+        const keysToRemove = Object.keys(keys).filter(key => 
+          key.startsWith('pdfTextCache_') || key.startsWith('processed_hashes_')
+        );
+        if (keysToRemove.length > 0) {
+          await chrome.storage.local.remove(keysToRemove);
+          addLog(`Successfully cleared ${keysToRemove.length} cached PDF text and hash entries.`, 'info');
+        } else {
+          addLog('No cached PDF text or deduplication entries found.', 'info');
+        }
+      } catch (err) {
+        addLog(`Failed to clear cache: ${err.message}`, 'error');
+      } finally {
+        clearCacheBtn.disabled = false;
+      }
+    });
+  }
+
   downloadBtn.addEventListener('click', async () => {
     logEntries.innerHTML = '';
     setRunning(true);
@@ -113,6 +136,7 @@ document.addEventListener('DOMContentLoaded', () => {
       addLog(`Found Ariba tab: ${aribaTab.title || aribaTab.url}`, 'info');
 
       // Store ephemeral per-run config in session storage (cleared on browser restart)
+      addLog('Saving config to session storage...', 'info');
       await chrome.storage.session.set({
         uploadConfig: { 
           connectAutoUpload, 
@@ -122,24 +146,23 @@ document.addEventListener('DOMContentLoaded', () => {
           deleteAfterUpload: deleteAfterUploadCheckbox.checked 
         }
       });
+      addLog('Config saved successfully.', 'info');
 
       // Clear any cached supplier name from a previous run to avoid stale data
+      addLog('Clearing cached supplier details...', 'info');
       await chrome.storage.local.remove(['lastSupplierName', 'lastRawSupplierName']);
 
       // Inject toast CSS before the script so classes are available on first call
+      addLog('Injecting toast stylesheet...', 'info');
       await chrome.scripting.insertCSS({
         target: { tabId: aribaTab.id, allFrames: true },
         files: ['content/content.css']
       });
+      addLog('Toast stylesheet injected.', 'info');
 
       // ── Pre-injection state reset ─────────────────────────────────────────
       // Always reset execution flags before each injection run.
-      // The Download button is disabled (setRunning) for the entire duration
-      // of a run, so a concurrent double-injection cannot happen — resetting
-      // here unconditionally is safe and ensures the re-entrant guard in
-      // content.js never silently blocks a legitimate second run.
-      // We also stamp the current version so content.js can detect stale
-      // code left behind from a previous extension version on an open tab.
+      addLog('Resetting page automation state...', 'info');
       const currentVersion = chrome.runtime.getManifest().version;
       await chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
@@ -154,13 +177,16 @@ document.addEventListener('DOMContentLoaded', () => {
         },
         args: [currentVersion]
       });
+      addLog('Page automation state reset completed.', 'info');
 
       // shared/constants.js must be injected first so sanitiseSupplierName()
       // in content.js has access to SUPPLIER_CLEAN_RULES at runtime.
+      addLog('Injecting main automation scripts...', 'info');
       await chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
         files: ['shared/constants.js', 'content/content.js']
       });
+      addLog('Automation scripts successfully injected into page.', 'info');
 
     } catch (err) {
       addLog('Error: ' + err.message, 'error');

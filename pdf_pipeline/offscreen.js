@@ -9,6 +9,31 @@
  * so `window.pdfjsLib` is available as a global here.
  */
 
+// ─── Global Error Relay ──────────────────────────────────────────────────────
+window.addEventListener('error', (event) => {
+  chrome.runtime.sendMessage({
+    type: 'status',
+    text: `[Offscreen Error] ${event.message} at ${event.filename}:${event.lineno}`,
+    error: true
+  }).catch(() => {});
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event.reason?.stack || event.reason?.message || String(event.reason);
+  chrome.runtime.sendMessage({
+    type: 'status',
+    text: `[Offscreen Unhandled Promise] ${reason}`,
+    error: true
+  }).catch(() => {});
+});
+// ─── requestAnimationFrame polyfill ──────────────────────────────────────────
+// Chrome NEVER fires requestAnimationFrame callbacks in offscreen documents
+// because they are invisible (no compositor frame). pdf.js uses rAF internally
+// for canvas rendering, which causes page.render() to hang forever.
+// Override with setTimeout(cb, 0) so rendering proceeds immediately.
+window.requestAnimationFrame = (callback) => setTimeout(callback, 0);
+window.cancelAnimationFrame = (id) => clearTimeout(id);
+
 // ─── pdf.js setup ────────────────────────────────────────────────────────────
 // Point the worker at the bundled worker file so pdf.js can parse off the
 // main thread without us needing to create a Worker manually.
@@ -28,10 +53,10 @@ function _collapseHorizontalWhitespace(text) {
 function _fixTrackingCodeZeros(text) {
   text = text.replaceAll('MOTNO', 'MOTN0');
   text = text.replaceAll('WBA1O', 'WBA10');
-  text = text.replace(/\b(MOT[A-Z]{0,3})O\b/g,   (_, p) => p + '0');
-  text = text.replace(/\b(WBA\d+)O\b/g,            (_, p) => p + '0');
+  text = text.replace(/\b(MOT[A-Z]{0,3})O\b/g, (_, p) => p + '0');
+  text = text.replace(/\b(WBA\d+)O\b/g, (_, p) => p + '0');
   text = text.replace(/\b([A-Z]{2,5}\d{2,})O\b/g, (_, p) => p + '0');
-  text = text.replace(/(\d+)O(\d+)/g, (_, a, b)  => a + '0' + b);
+  text = text.replace(/(\d+)O(\d+)/g, (_, a, b) => a + '0' + b);
   return text;
 }
 
@@ -65,7 +90,74 @@ function cleanExtractedText(raw) {
 
 // ─── Core extraction ──────────────────────────────────────────────────────────
 
-async function extractText(uint8Array) {
+// ─── Tesseract Worker helper ─────────────────────────────────────────────────
+let _tesseractWorker = null;
+let _tesseractWorkerPromise = null; // prevents race when multiple files init concurrently
+let currentOcrFilename = '';
+let currentOcrPage = 1;
+let totalOcrPages = 1;
+let lastReportedPercent = -1;
+let lastReportedStatus = '';
+
+function _sendOcrStatus(text) {
+  chrome.runtime.sendMessage({ type: 'status', text }).catch(() => {});
+}
+
+async function getTesseractWorker() {
+  if (_tesseractWorker) return _tesseractWorker;
+  // If another caller is already creating the worker, wait for that same promise
+  if (_tesseractWorkerPromise) return _tesseractWorkerPromise;
+
+  _sendOcrStatus('[OCR] Initializing Tesseract engine...');
+
+  _tesseractWorkerPromise = Tesseract.createWorker('eng', 1, {
+    workerPath: chrome.runtime.getURL('pdf_pipeline/worker.min.js'),
+    corePath: chrome.runtime.getURL('pdf_pipeline/tesseract-core.wasm.js'),
+    langPath: chrome.runtime.getURL('tessdata'),
+    workerBlobURL: false,
+    logger: m => {
+      // Report initialization phases (loading core, loading language data, etc.)
+      if (m.status !== lastReportedStatus && m.status !== 'recognizing text') {
+        lastReportedStatus = m.status;
+        _sendOcrStatus(`[OCR] ${m.status}...`);
+      }
+      // Report recognition progress at 10% increments
+      if (m.status === 'recognizing text') {
+        const percent = Math.round(m.progress * 100);
+        if (percent !== lastReportedPercent && percent % 10 === 0) {
+          lastReportedPercent = percent;
+          const pageStr = totalOcrPages > 1 ? ` (Page ${currentOcrPage}/${totalOcrPages})` : '';
+          _sendOcrStatus(`[OCR] ${currentOcrFilename}${pageStr}: ${percent}%`);
+        }
+      }
+    }
+  });
+
+  try {
+    _tesseractWorker = await _tesseractWorkerPromise;
+    _sendOcrStatus('[OCR] Tesseract engine ready.');
+    return _tesseractWorker;
+  } catch (err) {
+    _tesseractWorkerPromise = null; // allow retry on next call
+    _sendOcrStatus(`[OCR] Engine init FAILED: ${err.message}`);
+    throw err;
+  }
+}
+
+// ─── Core extraction ──────────────────────────────────────────────────────────
+
+// Extraction queue — serializes all PDF/image OCR work so only one
+// page.render() + worker.recognize() runs at a time. Prevents pdf.js
+// concurrent-render deadlocks in the offscreen document.
+let _extractionQueue = Promise.resolve();
+
+function queueExtraction(fn) {
+  const p = _extractionQueue.then(fn, fn); // run even if previous failed
+  _extractionQueue = p.catch(() => {}); // swallow so queue doesn't break
+  return p;
+}
+
+async function extractText(uint8Array, filename) {
   let pdf;
   try {
     const loadingTask = pdfjsLib.getDocument({ data: uint8Array });
@@ -77,125 +169,116 @@ async function extractText(uint8Array) {
     throw err;
   }
   
+  currentOcrFilename = filename || 'PDF';
+  totalOcrPages = pdf.numPages;
+
   const rawPages = [];
+  const worker = await getTesseractWorker();
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    currentOcrPage = pageNum;
+    lastReportedPercent = -1;
     try {
-      const page    = await pdf.getPage(pageNum);
-      const content = await page.getTextContent();
+      _sendOcrStatus(`[OCR] ${filename}: Loading page ${pageNum}/${pdf.numPages}...`);
+      const page = await pdf.getPage(pageNum);
+      
+      // Render page to canvas at scale 1.5 for good OCR accuracy with less memory
+      const viewport = page.getViewport({ scale: 1.5 });
+      const canvas = document.createElement('canvas');
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const context = canvas.getContext('2d');
+      
+      _sendOcrStatus(`[OCR] ${filename}: Rendering page ${pageNum} (${canvas.width}x${canvas.height})...`);
+      
+      // Timeout wrapper — pdf.js render can deadlock in some extension contexts
+      const renderPromise = page.render({ canvasContext: context, viewport }).promise;
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('page.render() timed out after 60s')), 60000)
+      );
+      await Promise.race([renderPromise, timeoutPromise]);
 
-      // Sort items top-to-bottom, left-to-right
-      const sorted = [...content.items].sort((a, b) => {
-        const dy = b.transform[5] - a.transform[5];
-        if (Math.abs(dy) > 5) return dy;
-        return a.transform[4] - b.transform[4];
-      });
-
-      // Group into lines by y-position proximity
-      const lines = [];
-      let currentLine = [], lastY = null;
-      for (const item of sorted) {
-        const y = item.transform[5];
-        if (lastY !== null && Math.abs(y - lastY) > 5) {
-          if (currentLine.length) lines.push(currentLine.join(' '));
-          currentLine = [];
-        }
-        if (item.str.trim()) currentLine.push(item.str.trim());
-        lastY = y;
-      }
-      if (currentLine.length) lines.push(currentLine.join(' '));
-      rawPages.push(lines.join('\n'));
+      _sendOcrStatus(`[OCR] ${filename}: Render complete. Starting OCR on page ${pageNum}...`);
+      const dataUrl = canvas.toDataURL('image/png');
+      const result = await worker.recognize(dataUrl);
+      const pageText = result.data.text.trim();
+      rawPages.push(pageText);
+      _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} done (${pageText.length} chars).`);
     } catch (pageErr) {
       console.warn(`[Offscreen] Page ${pageNum} failed:`, pageErr?.message);
-      rawPages.push('');
+      _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} FAILED: ${pageErr?.message}`);
+      rawPages.push(`[Page ${pageNum} OCR Failed]`);
     }
   }
 
   const raw = rawPages.join('\n\n');
-  if (!raw.trim()) return { text: '', isScanned: true };
-
-  // ── Garbled-text guard 1: U+FFFD replacement characters ─────────────────
-  // Some PDFs have fonts with no /ToUnicode map, so pdf.js emits U+FFFD
-  // instead of real text.  >30 % replacement chars = unusable.
-  const replacementCount = (raw.match(/\ufffd/g) || []).length;
-  const replacementRatio = replacementCount / Math.max(raw.length, 1);
-  if (replacementRatio > 0.3) {
-    console.warn(
-      `[Offscreen] Font encoding failure (U+FFFD) — ` +
-      `${(replacementRatio * 100).toFixed(1)}% replacement chars. ` +
-      `Flagging as isScanned.`
-    );
-    return { text: '', isScanned: true };
-  }
-
-  // ── Garbled-text guard 2: wrong-encoding symbol soup ─────────────────────
-  // A different failure mode: the font has a custom /Encoding vector that maps
-  // every glyph to the WRONG Unicode character (e.g. letters → punctuation).
-  // pdf.js decodes without errors, but the output is almost entirely symbols
-  // like `!  "#! !$!$  #  %  &  '  ()` with almost no real letters.
-  // Legitimate insurance/workcover PDFs must be >15 % alphabetic characters.
-  const nonWsChars = raw.replace(/\s/g, '');
-  if (nonWsChars.length > 50) {
-    const letterCount = (nonWsChars.match(/[a-zA-Z]/g) || []).length;
-    const letterRatio = letterCount / nonWsChars.length;
-    if (letterRatio < 0.15) {
-      console.warn(
-        `[Offscreen] Wrong font encoding detected — only ` +
-        `${(letterRatio * 100).toFixed(1)}% alphabetic chars (expected >15%). ` +
-        `Flagging as isScanned.`
-      );
-      return { text: '', isScanned: true };
-    }
-  }
-  
   const cleaned = cleanExtractedText(raw);
   
-  // ── Hybrid PDF Heuristic ──────────────────────────────────────────────────
-  // Some PDFs mix a digital cover/letterhead with scanned body pages.
-  // We check two things:
-  //
-  //   1. Per-page check: if ANY single page has fewer than 500 characters
-  //      it is treated as a scanned/image page.  Even if other pages have
-  //      plenty of text, one blank/image page means the document is a hybrid
-  //      and the full PDF should be sent to NLM instead of a partial .txt.
-  //
-  //   2. Total check (fallback): if the entire document averages fewer than
-  //      500 characters per page, flag as scanned regardless.
+  return { text: cleaned, isScanned: false, isPasswordProtected: false };
+}
 
-  const PAGE_MIN_CHARS = 500;
+// ─── Image OCR extraction ────────────────────────────────────────────────────
+async function extractImageText(uint8Array, mimeType, filename) {
+  currentOcrFilename = filename || 'Image';
+  totalOcrPages = 1;
+  currentOcrPage = 1;
+  lastReportedPercent = -1;
 
-  // Per-page check (on raw pages before cleaning, so spacing doesn't distort count)
-  const scannedPageIndex = rawPages.findIndex(p => p.trim().length < PAGE_MIN_CHARS);
-  if (scannedPageIndex !== -1) {
-    console.warn(
-      `[Offscreen] Page ${scannedPageIndex + 1} has only ` +
-      `${rawPages[scannedPageIndex].trim().length} chars (< ${PAGE_MIN_CHARS}) — ` +
-      `likely a scanned image page. Flagging whole document as isScanned.`
-    );
-    return { text: cleaned, isScanned: true };
-  }
-
-  // Total-length check (catches edge cases where all pages are sparse)
-  if (cleaned.length < (PAGE_MIN_CHARS * pdf.numPages)) {
-    return { text: cleaned, isScanned: true };
-  }
+  const blob = new Blob([uint8Array], { type: mimeType });
+  const url = URL.createObjectURL(blob);
   
-  return { text: cleaned, isScanned: false };
+  try {
+    const img = new Image();
+    img.src = url;
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const context = canvas.getContext('2d');
+    context.drawImage(img, 0, 0);
+
+    const worker = await getTesseractWorker();
+    const result = await worker.recognize(canvas);
+    const ocrText = result.data.text.trim();
+    const cleaned = cleanExtractedText(ocrText);
+    
+    return { text: cleaned };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 // ─── Message listener ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type !== 'EXTRACT_PDF_TEXT') return false;
+  if (msg.type === 'EXTRACT_PDF_TEXT') {
+    const binary = atob(msg.base64);
+    const uint8 = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) uint8[i] = binary.charCodeAt(i);
 
-  // Reconstruct Uint8Array from the base64 string sent by the service worker
-  const binary  = atob(msg.base64);
-  const uint8   = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) uint8[i] = binary.charCodeAt(i);
+    // Queue so only one extraction runs at a time (prevents pdf.js render deadlocks)
+    queueExtraction(() => extractText(uint8, msg.filename))
+      .then(({ text, isScanned, isPasswordProtected }) => sendResponse({ success: true, text, isScanned, isPasswordProtected }))
+      .catch(err => sendResponse({ success: false, error: err?.message ?? String(err) }));
 
-  extractText(uint8)
-    .then(({ text, isScanned, isPasswordProtected }) => sendResponse({ success: true, text, isScanned, isPasswordProtected }))
-    .catch(err => sendResponse({ success: false, error: err?.message ?? String(err) }));
+    return true;
+  }
 
-  return true; // keep message channel open for async response
+  if (msg.type === 'EXTRACT_IMAGE_TEXT') {
+    const binary = atob(msg.base64);
+    const uint8 = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) uint8[i] = binary.charCodeAt(i);
+
+    queueExtraction(() => extractImageText(uint8, msg.mimeType, msg.filename))
+      .then(({ text }) => sendResponse({ success: true, text }))
+      .catch(err => sendResponse({ success: false, error: err?.message ?? String(err) }));
+
+    return true;
+  }
+
+  return false;
 });

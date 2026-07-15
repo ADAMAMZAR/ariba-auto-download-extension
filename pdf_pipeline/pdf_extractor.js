@@ -72,9 +72,10 @@ function _arrayBufferToBase64(buffer) {
  * Delegates to the Offscreen Document for actual pdf.js parsing.
  *
  * @param {ArrayBuffer} arrayBuffer
+ * @param {string} filename
  * @returns {Promise<{ text: string, isScanned: boolean }>}
  */
-async function extractTextFromPdfBuffer(arrayBuffer) {
+async function extractTextFromPdfBuffer(arrayBuffer, filename) {
   try {
     await _ensureOffscreenDocument();
 
@@ -82,7 +83,8 @@ async function extractTextFromPdfBuffer(arrayBuffer) {
 
     const result = await chrome.runtime.sendMessage({
       type: 'EXTRACT_PDF_TEXT',
-      base64
+      base64,
+      filename
     });
 
     if (!result?.success) {
@@ -96,6 +98,42 @@ async function extractTextFromPdfBuffer(arrayBuffer) {
     return {
       text: `[VISUAL_EXTRACTION_BLOCKED]\n\nReason: ${err?.message ?? err}`,
       isScanned: true
+    };
+  }
+}
+
+/**
+ * Extract and clean text from an Image ArrayBuffer using local Tesseract OCR.
+ * Delegates to the Offscreen Document for actual Tesseract parsing.
+ *
+ * @param {ArrayBuffer} arrayBuffer
+ * @param {string} mimeType
+ * @param {string} filename
+ * @returns {Promise<{ text: string }>}
+ */
+async function extractTextFromImageBuffer(arrayBuffer, mimeType, filename) {
+  try {
+    await _ensureOffscreenDocument();
+
+    const base64 = _arrayBufferToBase64(arrayBuffer);
+
+    const result = await chrome.runtime.sendMessage({
+      type: 'EXTRACT_IMAGE_TEXT',
+      base64,
+      mimeType,
+      filename
+    });
+
+    if (!result?.success) {
+      throw new Error(result?.error ?? 'Unknown offscreen extraction error');
+    }
+
+    return { text: result.text };
+
+  } catch (err) {
+    console.error('[PDF Extractor] Offscreen image extraction failed:', err?.message ?? err);
+    return {
+      text: `[IMAGE_EXTRACTION_FAILED]\n\nReason: ${err?.message ?? err}`
     };
   }
 }
