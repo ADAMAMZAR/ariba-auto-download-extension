@@ -20,16 +20,31 @@
     <button id="stop-btn" class="btn-danger" style="display:none;">⏹ Stop</button>
 
     <div class="checkbox-group">
-      <input type="checkbox" id="connect-notebooklm" checked />
-      <label for="connect-notebooklm">Upload to NotebookLM after download</label>
+      <input type="checkbox" id="connect-auto-upload" checked />
+      <label for="connect-auto-upload">Auto-upload after download</label>
     </div>
 
-    <div id="notebooklm-container">
-      <div class="input-group">
-        <label for="notebooklm-url">NotebookLM Notebook URL</label>
-        <input type="url" id="notebooklm-url" placeholder="https://notebooklm.google.com/notebook/..." />
+    <div id="upload-settings-container">
+      <div class="radio-group-container" style="margin-top: 10px; margin-bottom: 10px;">
+        <label style="font-weight: bold; display: block; margin-bottom: 5px; font-size: 0.95em;">Upload Target:</label>
+        
+        <div class="radio-option" style="margin-bottom: 5px; display: flex; align-items: center;">
+          <input type="radio" id="target-gemini" name="upload-target" value="gemini" checked style="margin-right: 6px;" />
+          <label for="target-gemini" style="cursor: pointer;">Gemini Gem <span style="color: #4caf50; font-size: 0.9em; font-weight: bold;">(Recommended)</span></label>
+        </div>
+        
+        <div class="radio-option" style="margin-bottom: 8px; display: flex; align-items: center;">
+          <input type="radio" id="target-nlm" name="upload-target" value="nlm" style="margin-right: 6px;" />
+          <label for="target-nlm" style="cursor: pointer;">NotebookLM <span style="color: #ff9800; font-size: 0.9em; font-weight: bold;">(Legacy)</span></label>
+        </div>
       </div>
-      <div class="checkbox-group">
+
+      <div class="input-group" id="nlm-url-group" style="display: none; margin-bottom: 10px;">
+        <label for="nlm-notebook-url" style="font-size: 0.9em;">NotebookLM Notebook URL</label>
+        <input type="text" id="nlm-notebook-url" placeholder="https://notebooklm.google.com/notebook/..." style="width: 100%; box-sizing: border-box; padding: 6px;" />
+      </div>
+
+      <div class="checkbox-group" style="margin-top: 5px;">
         <input type="checkbox" id="delete-after-upload" />
         <label for="delete-after-upload">Delete local files after upload</label>
       </div>
@@ -49,7 +64,13 @@
       <textarea id="report-note" rows="3" placeholder="Supplier name was not correct."></textarea>
     </div>
     <button id="report-problem-btn" class="btn-secondary">Report a problem</button>
+
+    <div class="input-group" style="margin-top: 15px;">
+      <label for="network-log-box">Network Upload Log (Click to copy)</label>
+      <textarea id="network-log-box" rows="8" readonly style="width: 100%; font-family: monospace; font-size: 10px; background: #1e1e1e; color: #0f0; border: 1px solid #333; padding: 5px; box-sizing: border-box;" placeholder="Network log for push.clients6.google.com will appear here..."></textarea>
+    </div>
   </div>
+  <script src="../shared/constants.js"></script>
   <script src="panel.js"></script>
 </body>
 

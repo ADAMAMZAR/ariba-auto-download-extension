@@ -5,10 +5,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const downloadBtn = document.getElementById('download-btn');
   const stopBtn     = document.getElementById('stop-btn');
-  const connectCheckbox = document.getElementById('connect-notebooklm');
+  const connectCheckbox = document.getElementById('connect-auto-upload');
+  const targetGeminiRadio = document.getElementById('target-gemini');
+  const targetNlmRadio = document.getElementById('target-nlm');
+  const nlmUrlGroup = document.getElementById('nlm-url-group');
+  const nlmUrlInput = document.getElementById('nlm-notebook-url');
   const deleteAfterUploadCheckbox = document.getElementById('delete-after-upload');
-  const notebooklmContainer = document.getElementById('notebooklm-container');
-  const notebooklmUrlInput = document.getElementById('notebooklm-url');
+  const uploadSettingsContainer = document.getElementById('upload-settings-container');
   const logEntries = document.getElementById('log-entries');
 
   function addLog(text, type = 'info') {
@@ -28,27 +31,54 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ── Restore user prefs from local storage (persists across browser restarts) ──
-  // Both the URL field and the checkbox state are user preferences → chrome.storage.local.
-  // Only ephemeral per-run state (notebooklmConfig) lives in chrome.storage.session.
-  chrome.storage.local.get(['notebooklmUrl', 'connectToNotebooklm', 'deleteAfterUpload'], r => {
-    notebooklmUrlInput.value = r.notebooklmUrl || '';
-    
+  chrome.storage.local.get([
+    'connectAutoUpload', 
+    'uploadTarget', 
+    'nlmNotebookUrl', 
+    'deleteAfterUpload'
+  ], r => {
     // Default connection setting to true on first run (matching HTML initial state)
-    connectCheckbox.checked = typeof r.connectToNotebooklm === 'boolean' ? r.connectToNotebooklm : true;
+    connectCheckbox.checked = typeof r.connectAutoUpload === 'boolean' ? r.connectAutoUpload : true;
+    
+    const target = r.uploadTarget || 'gemini';
+    if (target === 'nlm') {
+      targetNlmRadio.checked = true;
+    } else {
+      targetGeminiRadio.checked = true;
+    }
+
+    nlmUrlInput.value = r.nlmNotebookUrl || '';
     
     // Default delete setting to false on first run
     deleteAfterUploadCheckbox.checked = typeof r.deleteAfterUpload === 'boolean' ? r.deleteAfterUpload : false;
     
-    notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
+    updateUiVisibility();
   });
 
-  notebooklmUrlInput.addEventListener('input', () => {
-    chrome.storage.local.set({ notebooklmUrl: notebooklmUrlInput.value });
-  });
+  function updateUiVisibility() {
+    const autoUpload = connectCheckbox.checked;
+    uploadSettingsContainer.style.display = autoUpload ? 'block' : 'none';
+    
+    if (autoUpload) {
+      nlmUrlGroup.style.display = targetNlmRadio.checked ? 'block' : 'none';
+    }
+  }
 
   connectCheckbox.addEventListener('change', () => {
-    notebooklmContainer.style.display = connectCheckbox.checked ? 'flex' : 'none';
-    chrome.storage.local.set({ connectToNotebooklm: connectCheckbox.checked });
+    updateUiVisibility();
+    chrome.storage.local.set({ connectAutoUpload: connectCheckbox.checked });
+  });
+
+  const onTargetChange = () => {
+    updateUiVisibility();
+    const target = targetNlmRadio.checked ? 'nlm' : 'gemini';
+    chrome.storage.local.set({ uploadTarget: target });
+  };
+  targetGeminiRadio.addEventListener('change', onTargetChange);
+  targetNlmRadio.addEventListener('change', onTargetChange);
+
+  nlmUrlInput.addEventListener('input', () => {
+    chrome.storage.local.set({ nlmNotebookUrl: nlmUrlInput.value.trim() });
   });
 
   deleteAfterUploadCheckbox.addEventListener('change', () => {
@@ -67,14 +97,9 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    const connectToNotebooklm = connectCheckbox.checked;
-    const notebooklmUrl = notebooklmUrlInput.value.trim();
-
-    if (connectToNotebooklm && !notebooklmUrl) {
-      addLog('Please enter the NotebookLM URL.', 'error');
-      setRunning(false);
-      return;
-    }
+    const connectAutoUpload = connectCheckbox.checked;
+    const uploadTarget = targetNlmRadio.checked ? 'nlm' : 'gemini';
+    const nlmUrl = nlmUrlInput.value.trim();
 
     try {
       const aribaTabs = await chrome.tabs.query({ url: '*://*.ariba.com/*' });
@@ -89,7 +114,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
       // Store ephemeral per-run config in session storage (cleared on browser restart)
       await chrome.storage.session.set({
-        notebooklmConfig: { connectToNotebooklm, notebooklmUrl, deleteAfterUpload: deleteAfterUploadCheckbox.checked }
+        uploadConfig: { 
+          connectAutoUpload, 
+          uploadTarget, 
+          geminiUrl: GEMINI_GEM_URL, 
+          nlmUrl, 
+          deleteAfterUpload: deleteAfterUploadCheckbox.checked 
+        }
       });
 
       // Clear any cached supplier name from a previous run to avoid stale data
@@ -182,6 +213,17 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
 
+  const networkLogBox = document.getElementById('network-log-box');
+  if (networkLogBox) {
+    networkLogBox.addEventListener('click', () => {
+      if (networkLogBox.value.trim().length > 0) {
+        networkLogBox.select();
+        document.execCommand('copy');
+        addLog('Copied network log to clipboard!', 'info');
+      }
+    });
+  }
+
   // Listen for status messages from content / background
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'status') {
@@ -189,6 +231,11 @@ document.addEventListener('DOMContentLoaded', () => {
       addLog(message.text, type);
       if (message.done || message.error) {
         setRunning(false);
+      }
+    } else if (message.action === 'logNetworkData') {
+      if (networkLogBox) {
+        networkLogBox.value += `\n=== NEW NETWORK REQUEST ===\n${message.logData}\n`;
+        networkLogBox.scrollTop = networkLogBox.scrollHeight;
       }
     }
   });

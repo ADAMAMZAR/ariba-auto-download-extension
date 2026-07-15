@@ -25,6 +25,7 @@ var RPC_FETCH_LABELS = 'agX4Bc'; // fetchLabels()        — list all labels
 var RPC_UPDATE_LABEL = 'le8sX';  // updateLabelAssignment() — add/remove label from source
 
 // ── External URLs ─────────────────────────────────────────────────────
+var GEMINI_GEM_URL = 'https://gemini.google.com/gem/98710ae19c8b';
 var NLM_API_BASE = 'https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute';
 var NLM_UPLOAD_BASE = 'https://notebooklm.google.com/upload/_/';
 

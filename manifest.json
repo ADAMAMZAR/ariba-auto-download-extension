@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GPO - Automatic Certificate Checker",
-  "version": "2.6.19",
+  "version": "2.6.20",
   "description": "Automatically expands and downloads attachments from Ariba, saving them in supplier-named folders.",
   "permissions": [
     "scripting",
@@ -15,6 +15,7 @@
   "host_permissions": [
     "*://*.ariba.com/*",
     "https://notebooklm.google.com/*",
+    "https://gemini.google.com/*",
     "https://gist.githubusercontent.com/*",
     "https://script.google.com/*",
     "https://script.googleusercontent.com/*"
@@ -37,6 +38,16 @@
     "service_worker": "background/background.js"
   },
   "web_accessible_resources": [
+    {
+      "resources": [
+        "shared/logger.js",
+        "shared/constants.js",
+        "gemini/gemini_runner.js"
+      ],
+      "matches": [
+        "*://gemini.google.com/*"
+      ]
+    },
     {
       "resources": [
         "shared/logger.js",

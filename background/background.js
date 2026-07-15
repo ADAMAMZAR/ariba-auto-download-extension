@@ -304,10 +304,10 @@ chrome.runtime.onUpdateAvailable.addListener((details) => {
   // Check whether a download job is currently active.
   // We use chrome.storage.session as the source of truth because it survives
   // service-worker restarts (unlike in-memory variables).
-  chrome.storage.session.get(['notebooklmConfig'], (result) => {
-    // notebooklmConfig is set at the start of a run and cleared when idle.
+  chrome.storage.session.get(['uploadConfig'], (result) => {
+    // uploadConfig is set at the start of a run and cleared when idle.
     // If it exists, a job may be in progress — defer the reload.
-    const jobIsActive = !!(result && result.notebooklmConfig);
+    const jobIsActive = !!(result && result.uploadConfig);
 
     if (jobIsActive) {
       // ── A download is in progress — do NOT interrupt it ────────────────────
@@ -713,18 +713,22 @@ async function deleteSupplierDownloads(supplier) {
 // -----------------------------------------------------------------------
 // filesForNotebook is passed directly (NOT via session storage) to avoid
 // blowing the 10 MB chrome.storage.session quota with large base64 blobs.
-async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
+// -----------------------------------------------------------------------
+// Open Gemini Gem once downloads are done, then interact with the upload input
+// -----------------------------------------------------------------------
+// filesForGemini is passed directly (NOT via session storage) to avoid
+// blowing the 10 MB chrome.storage.session quota with large base64 blobs.
+async function maybeOpenGemini(supplier, filesForGemini = []) {
   const state = await getState(supplier);
   if (!state.filesDone) return;
 
-  // Check if we should skip NotebookLM (either disabled, or no valid files to upload other than QA data)
-  const hasOnlyQaFile = filesForNotebook.length === 1 && filesForNotebook[0].filename.endsWith('QA_Data.md');
-  const skipNotebookLm = !state.config?.connectToNotebooklm || filesForNotebook.length === 0 || hasOnlyQaFile;
+  // Check if we should skip Gemini (either disabled, or no valid files to upload other than QA data)
+  const hasOnlyQaFile = filesForGemini.length === 1 && filesForGemini[0].filename.endsWith('QA_Data.md');
+  const skipGemini = state.config?.connectAutoUpload !== true || state.config?.uploadTarget !== 'gemini' || filesForGemini.length === 0 || hasOnlyQaFile;
 
-  if (skipNotebookLm) {
-    // NLM disabled or nothing to upload — clear state now and we're done
+  if (skipGemini) {
     if (hasOnlyQaFile) {
-      notifyPanel('Only QA Markdown available. Skipping NotebookLM upload.');
+      notifyPanel('Only QA Markdown available. Skipping Gemini upload.');
     }
     await clearState(supplier);
     notifyAribaTab(state.aribaTabId, 'Downloads complete!');
@@ -732,32 +736,39 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
     return;
   }
 
-  // NLM enabled — keep state alive until nlm_upload_done fires so
+  // Gemini enabled — keep state alive until gemini_upload_done fires so
   // diskDownloadIds are still readable for post-upload deletion.
-  // Clear state now only when deleteAfterUpload is OFF (nothing to wait for).
   if (!state.config?.deleteAfterUpload) {
     await clearState(supplier);
   }
 
-  // Note: filesForNotebook is received as a direct parameter, not from
-  // session storage, to avoid the 10 MB session quota limit.
-  notifyPanel('Fetching latest system instructions...');
-  let gistText;
-  try {
-    gistText = await fetchGistContent();
-  } catch (err) {
-    const msg = 'Failed to fetch system instructions: ' + err.message;
-    notifyPanel(msg, true, true); // done:true so panel re-enables the Download button
-    notifyAribaTab(state.aribaTabId, msg, true);
-    return; // ← stop completely; do NOT open NotebookLM with empty instructions
-  }
+  notifyPanel('Opening Gemini Gem...');
+  const tab = await chrome.tabs.create({ url: state.config.geminiUrl });
 
-  notifyPanel('Opening NotebookLM...');
-  const tab = await chrome.tabs.create({ url: state.config.notebooklmUrl });
+  // Attach chrome.debugger to log network upload requests directly from the tab
+  const debuggerTarget = { tabId: tab.id };
+  chrome.debugger.attach(debuggerTarget, '1.3', () => {
+    if (chrome.runtime.lastError) {
+      console.warn('[Ariba Ext] Failed to attach debugger:', chrome.runtime.lastError.message);
+      return;
+    }
+    chrome.debugger.sendCommand(debuggerTarget, 'Network.enable', {}, () => {
+      if (chrome.runtime.lastError) {
+        console.warn('[Ariba Ext] Failed to enable Network domain:', chrome.runtime.lastError.message);
+      }
+    });
+  });
 
+  // Clean up debugger when tab is closed
+  const tabRemovedListener = (removedTabId) => {
+    if (removedTabId === tab.id) {
+      chrome.debugger.detach(debuggerTarget, () => { chrome.runtime.lastError; });
+      chrome.tabs.onRemoved.removeListener(tabRemovedListener);
+    }
+  };
+  chrome.tabs.onRemoved.addListener(tabRemovedListener);
 
-  // Wait for the page to fully load, then inject the checkbox and sync script
-  // Guard: prevent the script from firing more than once if 'complete' triggers multiple times
+  // Wait for the page to fully load, then inject the runner script
   let fired = false;
   chrome.tabs.onUpdated.addListener(async function listener(tabId, info) {
     if (tabId !== tab.id || info.status !== 'complete') return;
@@ -769,15 +780,116 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => {
-          if (!window.hasNotebookLMMsgBridge) {
-            window.hasNotebookLMMsgBridge = true;
+          if (!window.hasGeminiMsgBridge) {
+            window.hasGeminiMsgBridge = true;
+            window.addEventListener('message', (event) => {
+              if (event.data && event.data.source === 'ariba-gemini-injected') {
+                // Relay action messages (e.g. gemini_upload_done) directly to the background
+                if (event.data.action) {
+                  chrome.runtime.sendMessage(event.data).catch(() => { });
+                } else {
+                  chrome.runtime.sendMessage({
+                    type: 'status',
+                    text: event.data.text,
+                    error: event.data.error,
+                    done: event.data.done
+                  }).catch(() => { });
+                }
+              }
+            });
+          }
+        }
+      });
+    } catch (e) {
+      console.warn('[Ariba Ext] Failed to inject Gemini message bridge:', e?.message ?? e);
+    }
+
+    // 2. Pass args to the runner script by writing them onto window in the MAIN world.
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      func: (filesToUpload) => {
+        window.__aribaRunnerArgs = { filesToUpload };
+      },
+      args: [filesForGemini]
+    });
+
+    // 3. Inject the runner as an external file.
+    chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      files: ['gemini/gemini_runner.js']
+    }, (results) => {
+      if (chrome.runtime.lastError) {
+        notifyPanel('Gemini Injection script error: ' + chrome.runtime.lastError.message, true, true);
+        notifyAribaTab(state.aribaTabId, 'Gemini injection failed: ' + chrome.runtime.lastError.message, true);
+        chrome.tabs.onUpdated.removeListener(listener);
+        return;
+      }
+      chrome.tabs.onUpdated.removeListener(listener);
+    });
+
+    notifyPanel('Gemini Gem opened and runner injected!', false, true);
+  });
+}
+
+// -----------------------------------------------------------------------
+// Open NotebookLM once downloads are done, then interact with the upload input
+// -----------------------------------------------------------------------
+async function maybeOpenNotebookLM(supplier, filesForNlm = []) {
+  const s = cleanName(supplier);
+  const state = await getState(s);
+  if (!state || !state.filesDone) return;
+
+  const hasOnlyQaFile = filesForNlm.length === 1 && filesForNlm[0].filename.endsWith('QA_Data.md');
+  const skipNlm = state.config?.connectAutoUpload !== true || state.config?.uploadTarget !== 'nlm' || filesForNlm.length === 0 || hasOnlyQaFile;
+
+  if (skipNlm) {
+    if (hasOnlyQaFile) {
+      notifyPanel('Only QA Markdown available. Skipping NotebookLM upload.');
+    }
+    await clearState(s);
+    notifyAribaTab(state.aribaTabId, 'Downloads complete!');
+    notifyPanel('Downloads complete!', false, true);
+    return;
+  }
+
+  // NLM enabled — keep state alive until nlm_upload_done fires so
+  // diskDownloadIds are still readable for post-upload deletion.
+  if (!state.config?.deleteAfterUpload) {
+    await clearState(supplier);
+  }
+
+  notifyPanel('Opening NotebookLM...');
+  const tab = await chrome.tabs.create({ url: state.config.nlmUrl });
+
+  // Wait for the page to fully load, then inject the runner script
+  let fired = false;
+  chrome.tabs.onUpdated.addListener(async function listener(tabId, info) {
+    if (tabId !== tab.id || info.status !== 'complete') return;
+    if (fired) return;
+    fired = true;
+
+    // 1. Fetch system instruction text from Gist first
+    let instructionText = '';
+    try {
+      notifyPanel('Fetching system instructions...');
+      instructionText = await fetchGistContent();
+    } catch (e) {
+      console.warn('[Ariba Ext] Failed to fetch gist instruction for NLM:', e.message);
+    }
+
+    // 2. Inject message bridge in isolated world
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          if (!window.hasNlmMsgBridge) {
+            window.hasNlmMsgBridge = true;
             window.addEventListener('message', (event) => {
               if (event.data && event.data.source === 'ariba-notebooklm-injected') {
-                // Relay action messages (e.g. nlm_upload_done) directly to the background
                 if (event.data.action) {
-                  chrome.runtime.sendMessage({
-                    action: event.data.action
-                  }).catch(() => { });
+                  chrome.runtime.sendMessage(event.data).catch(() => { });
                 } else {
                   chrome.runtime.sendMessage({
                     type: 'status',
@@ -795,42 +907,32 @@ async function maybeOpenNotebookLM(supplier, filesForNotebook = []) {
       console.warn('[Ariba Ext] Failed to inject NLM message bridge:', e?.message ?? e);
     }
 
-    // 2. Pass args to the runner script by writing them onto window in the MAIN world.
-    //    This tiny shim is the only inline func — the real logic lives in nlm_runner.js.
+    // 3. Pass args to the runner script by writing them onto window in the MAIN world
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN',
       func: (instructionText, filesToUpload) => {
         window.__aribaRunnerArgs = { instructionText, filesToUpload };
       },
-      args: [gistText, filesForNotebook]
+      args: [instructionText, filesForNlm]
     });
 
-    // 3a. Inject constants.js into the MAIN world so nlm_runner.js can read the RPC IDs.
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: 'MAIN',
-      files: ['shared/constants.js']
-    });
-
-    // 3b. Inject the runner as an external file — fully debuggable and lintable.
+    // 4. Inject the runner file
     chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN',
-      files: ['notebooklm/nlm_runner.js']
+      files: ['shared/constants.js', 'notebooklm/nlm_runner.js']
     }, (results) => {
       if (chrome.runtime.lastError) {
-        notifyPanel('Sync/Checkbox script error: ' + chrome.runtime.lastError.message, true, true); // done:true so panel re-enables the Download button
+        notifyPanel('NotebookLM Injection script error: ' + chrome.runtime.lastError.message, true, true);
         notifyAribaTab(state.aribaTabId, 'NotebookLM injection failed: ' + chrome.runtime.lastError.message, true);
         chrome.tabs.onUpdated.removeListener(listener);
         return;
       }
-      // nlm_runner.js is an IIFE — results[0].result is not 'done', so we
-      // remove the listener here unconditionally once the script has executed.
       chrome.tabs.onUpdated.removeListener(listener);
     });
 
-    notifyPanel('NotebookLM opened and system instructions synced!', false, true);
+    notifyPanel('NotebookLM opened and runner injected!', false, true);
   });
 }
 
@@ -943,8 +1045,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return;
     }
 
-    // ── Triggered by nlm_runner.js after all files are uploaded and processed ──
-    if (request.action === 'nlm_upload_done') {
+    // ── Triggered by nlm_runner.js or gemini_runner.js after all files are uploaded ──
+    if (request.action === 'gemini_upload_done' || request.action === 'nlm_upload_done') {
+      if (request.action === 'gemini_upload_done' && sender.tab?.id) {
+        chrome.debugger.detach({ tabId: sender.tab.id }, () => { chrome.runtime.lastError; });
+      }
       try {
         // Find the session entry with diskDownloadIds and deleteAfterUpload flag
         const allData = await chrome.storage.session.get(null);
@@ -994,11 +1099,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           _currentReportSupplier = request.rawSupplierName || request.supplierName || s;
           const tabId = sender.tab?.id;
 
-          // Check NotebookLM config FIRST — skip all fetch() work if NLM is disabled
-          const { notebooklmConfig } = await chrome.storage.session.get('notebooklmConfig');
-          const nlmEnabled = notebooklmConfig?.connectToNotebooklm === true;
+          // Check upload config FIRST — skip all fetch() work if auto-upload is disabled
+          const { uploadConfig } = await chrome.storage.session.get('uploadConfig');
+          const uploadEnabled = uploadConfig?.connectAutoUpload === true;
 
-          // ── Process files with bounded concurrency: Fetch → Extract → Disk + NLM ──
+          // ── Process files with bounded concurrency: Fetch → Extract → Disk + Gemini ──
           // Files are independent, so several can be in flight at once instead of each
           // one's fetch + extraction + disk-save fully finishing before the next starts.
           // The dedup checks below (seenHashes / usedFilenames) are plain synchronous
@@ -1007,7 +1112,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const DOWNLOAD_CONCURRENCY = 4;
           const files = request.files || [];
           const diskDownloadIds = [];
-          const filesForNotebook = [];
+          const filesForGemini = [];
           const compiledTextList = [];
           const usedFilenames = new Set(); // Track filenames to guarantee uniqueness
           const seenHashes = new Map(); // hash -> filename, to skip byte-identical duplicate files this run
@@ -1389,8 +1494,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const compiledDataUrl = `data:text/plain;charset=utf-8;base64,${base64Compiled}`;
 
             const compiledFilename = `${s} - Extracted_Data.txt`;
-            if (nlmEnabled) {
-              filesForNotebook.push({
+             if (uploadEnabled) {
+              filesForGemini.push({
                 filename: compiledFilename,
                 dataUrl: compiledDataUrl,
                 mimeType: 'text/plain'
@@ -1451,8 +1556,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
             const qaFilename = `${s} - QA_Data.md`;
 
-            if (nlmEnabled) {
-              filesForNotebook.push({
+             if (uploadEnabled) {
+              filesForGemini.push({
                 filename: qaFilename,
                 dataUrl: dataUrl,
                 mimeType: 'text/markdown'
@@ -1515,15 +1620,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
 
           const state = await getState(s);
-          state.config = notebooklmConfig || null;
+          state.config = uploadConfig || null;
           state.filesDone = true;
-          // filesForNotebook is NOT stored in session to avoid quota overflow.
-          // It is passed directly to maybeOpenNotebookLM as a parameter.
           state.aribaTabId = tabId;
           state.diskDownloadIds = diskDownloadIds;
           state.supplierKey = s;
           await setState(s, state);
-          await maybeOpenNotebookLM(s, filesForNotebook);
+
+          const autoUploadEnabled = uploadConfig?.connectAutoUpload === true;
+          if (autoUploadEnabled) {
+            if (uploadConfig.uploadTarget === 'nlm') {
+              await maybeOpenNotebookLM(s, filesForGemini);
+            } else {
+              await maybeOpenGemini(s, filesForGemini);
+            }
+          } else {
+            await clearState(s);
+            notifyAribaTab(tabId, 'Downloads complete!');
+            notifyPanel('Downloads complete!', false, true);
+          }
 
         })()]); // end Promise.race
       } catch (err) {
@@ -1545,9 +1660,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         clearTimeout(timeoutHandle);
         clearStopSignal();
         // Clear the run config so onUpdateAvailable doesn't see a stale
-        // 'notebooklmConfig' and wrongly treat it as an active job on the
+        // 'uploadConfig' and wrongly treat it as an active job on the
         // next update check (e.g. if Chrome was closed mid-run last time).
-        chrome.storage.session.remove('notebooklmConfig').catch(() => { });
+        chrome.storage.session.remove('uploadConfig').catch(() => { });
 
       }
     }
@@ -1586,5 +1701,65 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         console.warn('[Ariba Ext] JS inject failed:', err);
       }
     });
+  }
+});
+
+// ── Chrome Debugger Network Interception ───────────────────────────────────
+// Captures raw HTTP requests, headers, and responses for Gemini upload endpoints.
+const activeRequestLogs = {};
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const tabId = source.tabId;
+  
+  if (method === 'Network.requestWillBeSent') {
+    const url = params.request.url;
+    const isUploadRequest = url.includes('clients6.google.com') || 
+                            url.includes('push.clients6.google.com') ||
+                            url.includes('BardChatUi/data/batchexecute');
+    
+    if (isUploadRequest) {
+      if (!activeRequestLogs[tabId]) {
+        activeRequestLogs[tabId] = {};
+      }
+      activeRequestLogs[tabId][params.requestId] = {
+        url,
+        method: params.request.method,
+        requestHeaders: params.request.headers,
+        requestBody: params.request.postData || null,
+        responseStatus: null,
+        responseHeaders: {},
+        responseBody: null
+      };
+    }
+  }
+
+  if (method === 'Network.responseReceived') {
+    const logData = activeRequestLogs[tabId]?.[params.requestId];
+    if (logData) {
+      logData.responseStatus = params.response.status;
+      logData.responseHeaders = params.response.headers;
+
+      // Fetch response body after a brief delay to ensure standard loading finishes
+      setTimeout(() => {
+        chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: params.requestId }, (result) => {
+          if (!chrome.runtime.lastError && result) {
+            logData.responseBody = result.body;
+          } else {
+            logData.responseBody = '[Failed to retrieve response body: ' + (chrome.runtime.lastError?.message || 'unknown') + ']';
+          }
+
+          // Send to the panel
+          chrome.runtime.sendMessage({
+            action: 'logNetworkData',
+            logData: JSON.stringify(logData, null, 2)
+          }).catch(() => {});
+
+          // Clean up this request
+          if (activeRequestLogs[source.tabId]) {
+            delete activeRequestLogs[source.tabId][params.requestId];
+          }
+        });
+      }, 500);
+    }
   }
 });
