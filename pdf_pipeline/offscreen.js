@@ -90,55 +90,58 @@ function cleanExtractedText(raw) {
 
 // ─── Core extraction ──────────────────────────────────────────────────────────
 
-// ─── Tesseract Worker helper ─────────────────────────────────────────────────
-let _tesseractWorker = null;
-let _tesseractWorkerPromise = null; // prevents race when multiple files init concurrently
+// ─── Tesseract Worker Pool ────────────────────────────────────────────────────
+// Uses a pool of OCR_POOL_SIZE workers managed by Tesseract.createScheduler()
+// so multiple pages can be OCR'd in parallel instead of one at a time.
+const OCR_POOL_SIZE = 3;
+let _tesseractScheduler = null;
+let _tesseractSchedulerPromise = null;
 let currentOcrFilename = '';
-let currentOcrPage = 1;
-let totalOcrPages = 1;
-let lastReportedPercent = -1;
+let _ocrPagesCompleted = 0;
+let _ocrPagesTotal = 0;
 let lastReportedStatus = '';
 
 function _sendOcrStatus(text) {
   chrome.runtime.sendMessage({ type: 'status', text }).catch(() => {});
 }
 
-async function getTesseractWorker() {
-  if (_tesseractWorker) return _tesseractWorker;
-  // If another caller is already creating the worker, wait for that same promise
-  if (_tesseractWorkerPromise) return _tesseractWorkerPromise;
+async function getTesseractScheduler() {
+  if (_tesseractScheduler) return _tesseractScheduler;
+  if (_tesseractSchedulerPromise) return _tesseractSchedulerPromise;
 
-  _sendOcrStatus('[OCR] Initializing Tesseract engine...');
+  _sendOcrStatus(`[OCR] Initializing Tesseract engine (${OCR_POOL_SIZE} workers)...`);
 
-  _tesseractWorkerPromise = Tesseract.createWorker('eng', 1, {
-    workerPath: chrome.runtime.getURL('pdf_pipeline/worker.min.js'),
-    corePath: chrome.runtime.getURL('pdf_pipeline/tesseract-core.wasm.js'),
-    langPath: chrome.runtime.getURL('tessdata'),
-    workerBlobURL: false,
-    logger: m => {
-      // Report initialization phases (loading core, loading language data, etc.)
-      if (m.status !== lastReportedStatus && m.status !== 'recognizing text') {
-        lastReportedStatus = m.status;
-        _sendOcrStatus(`[OCR] ${m.status}...`);
-      }
-      // Report recognition progress at 10% increments
-      if (m.status === 'recognizing text') {
-        const percent = Math.round(m.progress * 100);
-        if (percent !== lastReportedPercent && percent % 10 === 0) {
-          lastReportedPercent = percent;
-          const pageStr = totalOcrPages > 1 ? ` (Page ${currentOcrPage}/${totalOcrPages})` : '';
-          _sendOcrStatus(`[OCR] ${currentOcrFilename}${pageStr}: ${percent}%`);
+  _tesseractSchedulerPromise = (async () => {
+    const scheduler = Tesseract.createScheduler();
+
+    for (let i = 0; i < OCR_POOL_SIZE; i++) {
+      _sendOcrStatus(`[OCR] Loading worker ${i + 1}/${OCR_POOL_SIZE}...`);
+      const worker = await Tesseract.createWorker('eng', 1, {
+        workerPath: chrome.runtime.getURL('pdf_pipeline/worker.min.js'),
+        corePath: chrome.runtime.getURL('pdf_pipeline/tesseract-core.wasm.js'),
+        langPath: chrome.runtime.getURL('tessdata'),
+        workerBlobURL: false,
+        logger: m => {
+          // Report initialization phases only (per-page progress tracked separately)
+          if (m.status && m.status !== 'recognizing text' && m.status !== lastReportedStatus) {
+            lastReportedStatus = m.status;
+            _sendOcrStatus(`[OCR] Worker ${i + 1}: ${m.status}...`);
+          }
         }
-      }
+      });
+      scheduler.addWorker(worker);
+      _sendOcrStatus(`[OCR] Worker ${i + 1}/${OCR_POOL_SIZE} ready.`);
     }
-  });
+
+    return scheduler;
+  })();
 
   try {
-    _tesseractWorker = await _tesseractWorkerPromise;
-    _sendOcrStatus('[OCR] Tesseract engine ready.');
-    return _tesseractWorker;
+    _tesseractScheduler = await _tesseractSchedulerPromise;
+    _sendOcrStatus(`[OCR] All ${OCR_POOL_SIZE} workers ready.`);
+    return _tesseractScheduler;
   } catch (err) {
-    _tesseractWorkerPromise = null; // allow retry on next call
+    _tesseractSchedulerPromise = null; // allow retry on next call
     _sendOcrStatus(`[OCR] Engine init FAILED: ${err.message}`);
     throw err;
   }
@@ -157,6 +160,172 @@ function queueExtraction(fn) {
   return p;
 }
 
+// ─── Hybrid extraction helpers ────────────────────────────────────────────────
+
+/**
+ * Convert pdf.js TextContent to a plain string with line breaks preserved.
+ * Uses hasEOL when available (pdf.js 3.x+), falls back to simple join.
+ */
+function textContentToString(textContent) {
+  let text = '';
+  let hasEolSupport = false;
+  for (const item of textContent.items) {
+    if (item.str) text += item.str;
+    if (item.hasEOL !== undefined) {
+      hasEolSupport = true;
+      if (item.hasEOL) text += '\n';
+    }
+  }
+  // If hasEOL was never present (older pdf.js), add spaces between items
+  if (!hasEolSupport) {
+    text = textContent.items.map(i => i.str || '').join(' ');
+  }
+  return text.trim();
+}
+
+/**
+ * Extract embedded image objects from a PDF page via the operator list.
+ * Returns only images large enough to potentially contain text (≥ 30×30 px).
+ * Falls back to empty array if the API is unavailable or fails.
+ */
+async function getPageImages(page) {
+  if (!page.objs || typeof page.objs.get !== 'function') return [];
+
+  const ops = await page.getOperatorList();
+  const IMAGE_OPS = new Set([
+    pdfjsLib.OPS.paintImageXObject,
+    pdfjsLib.OPS.paintJpegXObject,
+    pdfjsLib.OPS.paintImageXObjectRepeat,
+  ]);
+
+  // Collect unique image names referenced by paint operations
+  const seenNames = new Set();
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    if (IMAGE_OPS.has(ops.fnArray[i])) {
+      seenNames.add(ops.argsArray[i][0]);
+    }
+  }
+  if (seenNames.size === 0) return [];
+
+  // Load image data for each unique image
+  const images = [];
+  for (const imgName of seenNames) {
+    try {
+      const imgData = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('timeout')), 10000);
+        page.objs.get(imgName, (data) => { clearTimeout(timeout); resolve(data); });
+      });
+
+      // Determine dimensions (handle ImageBitmap vs raw pixel data)
+      let width, height;
+      if (imgData instanceof ImageBitmap) {
+        width = imgData.width; height = imgData.height;
+      } else if (imgData?.bitmap instanceof ImageBitmap) {
+        width = imgData.bitmap.width; height = imgData.bitmap.height;
+      } else if (imgData?.width && imgData?.height) {
+        width = imgData.width; height = imgData.height;
+      } else {
+        continue; // Unknown format, skip
+      }
+
+      // Skip tiny images (decorative borders, spacers, styling blocks)
+      if (width < 30 || height < 30 || width * height < 2500) continue;
+
+      images.push({ name: imgName, data: imgData, width, height });
+    } catch (err) {
+      console.warn(`[Offscreen] Couldn't load image ${imgName}:`, err?.message);
+    }
+  }
+  return images;
+}
+
+/**
+ * Paint a pdf.js image object onto a canvas for OCR.
+ * Handles ImageBitmap (modern pdf.js) and raw pixel data (RGBA/RGB/1BPP).
+ */
+function paintImageToCanvas(imgData) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+
+  // Handle ImageBitmap (modern pdf.js with OffscreenCanvas support)
+  if (imgData instanceof ImageBitmap || imgData?.bitmap instanceof ImageBitmap) {
+    const bmp = imgData instanceof ImageBitmap ? imgData : imgData.bitmap;
+    canvas.width = bmp.width;
+    canvas.height = bmp.height;
+    ctx.drawImage(bmp, 0, 0);
+    return canvas;
+  }
+
+  // Handle raw pixel data
+  const { width, height, data, kind } = imgData;
+  if (!data || !width || !height) throw new Error('Invalid image data');
+
+  canvas.width = width;
+  canvas.height = height;
+  const pixels = width * height;
+
+  let rgba;
+  if (kind === 3 || data.length === pixels * 4) {
+    // RGBA_32BPP
+    rgba = data instanceof Uint8ClampedArray ? data : new Uint8ClampedArray(data);
+  } else if (kind === 2 || data.length === pixels * 3) {
+    // RGB_24BPP → RGBA
+    rgba = new Uint8ClampedArray(pixels * 4);
+    for (let s = 0, d = 0; s < data.length; s += 3, d += 4) {
+      rgba[d] = data[s]; rgba[d+1] = data[s+1]; rgba[d+2] = data[s+2]; rgba[d+3] = 255;
+    }
+  } else if (kind === 1) {
+    // GRAYSCALE_1BPP — each bit is a pixel (packed 8 per byte)
+    rgba = new Uint8ClampedArray(pixels * 4);
+    for (let i = 0; i < pixels; i++) {
+      const v = ((data[i >> 3] >> (7 - (i & 7))) & 1) ? 0 : 255;
+      rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = v; rgba[i*4+3] = 255;
+    }
+  } else if (data.length === pixels) {
+    // Grayscale 8bpp
+    rgba = new Uint8ClampedArray(pixels * 4);
+    for (let i = 0; i < pixels; i++) {
+      rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = data[i]; rgba[i*4+3] = 255;
+    }
+  } else {
+    // Unknown format — best effort as RGBA
+    rgba = data instanceof Uint8ClampedArray ? data : new Uint8ClampedArray(data);
+  }
+
+  ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+  return canvas;
+}
+
+/**
+ * Full-page OCR fallback — renders the entire page to canvas and OCRs it.
+ * Used when image extraction fails for a page.
+ */
+async function _fullPageOcr(page, scheduler, filename, pageNum) {
+  const baseViewport = page.getViewport({ scale: 1.0 });
+  const scale = (baseViewport.width >= 1500 || baseViewport.height >= 2000) ? 1.0 : 1.5;
+  const viewport = page.getViewport({ scale });
+
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+
+  const renderPromise = page.render({ canvasContext: ctx, viewport }).promise;
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('page.render() timed out after 60s')), 60000)
+  );
+  await Promise.race([renderPromise, timeoutPromise]);
+
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  canvas.width = 0;
+  canvas.height = 0;
+
+  const result = await scheduler.addJob('recognize', dataUrl);
+  return result.data.text.trim();
+}
+
+// ─── Main PDF extraction (Hybrid: native text + image-only OCR) ───────────────
+
 async function extractText(uint8Array, filename) {
   let pdf;
   try {
@@ -168,65 +337,140 @@ async function extractText(uint8Array, filename) {
     }
     throw err;
   }
-  
-  currentOcrFilename = filename || 'PDF';
-  totalOcrPages = pdf.numPages;
 
-  const rawPages = [];
-  const worker = await getTesseractWorker();
+  currentOcrFilename = filename || 'PDF';
+  _ocrPagesCompleted = 0;
+  _ocrPagesTotal = pdf.numPages;
+
+  const scheduler = await getTesseractScheduler();
+
+  // Each page becomes a Promise that resolves to { pageNum, text }.
+  // Native text extraction is synchronous per page, but image OCR jobs are
+  // submitted to the scheduler in parallel across all pages and workers.
+  const pagePromises = [];
+
+  _sendOcrStatus(`[Extract] ${filename}: Processing ${pdf.numPages} pages...`);
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-    currentOcrPage = pageNum;
-    lastReportedPercent = -1;
     try {
-      _sendOcrStatus(`[OCR] ${filename}: Loading page ${pageNum}/${pdf.numPages}...`);
       const page = await pdf.getPage(pageNum);
-      
-      // Render page to canvas at scale 1.5 for good OCR accuracy with less memory
-      const viewport = page.getViewport({ scale: 1.5 });
-      const canvas = document.createElement('canvas');
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const context = canvas.getContext('2d');
-      
-      _sendOcrStatus(`[OCR] ${filename}: Rendering page ${pageNum} (${canvas.width}x${canvas.height})...`);
-      
-      // Timeout wrapper — pdf.js render can deadlock in some extension contexts
-      const renderPromise = page.render({ canvasContext: context, viewport }).promise;
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('page.render() timed out after 60s')), 60000)
-      );
-      await Promise.race([renderPromise, timeoutPromise]);
 
-      _sendOcrStatus(`[OCR] ${filename}: Render complete. Starting OCR on page ${pageNum}...`);
-      const dataUrl = canvas.toDataURL('image/png');
-      const result = await worker.recognize(dataUrl);
-      const pageText = result.data.text.trim();
-      rawPages.push(pageText);
-      _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} done (${pageText.length} chars).`);
+      // ── Step 1: Native text extraction (instant, 100% accurate) ──
+      let nativeText = '';
+      try {
+        _sendOcrStatus(`[Extract] ${filename}: Page ${pageNum}/${pdf.numPages} — extracting native text...`);
+        const textContent = await page.getTextContent();
+        nativeText = textContentToString(textContent);
+      } catch (e) {
+        console.warn(`[Offscreen] Page ${pageNum} native text failed:`, e?.message);
+      }
+
+      // ── Step 2: Detect and extract embedded images ──
+      let imageOcrSucceeded = false;
+      try {
+        const images = await getPageImages(page);
+
+        if (images.length === 0) {
+          // Fast path — no images, native text only (zero OCR needed!)
+          _ocrPagesCompleted++;
+          _sendOcrStatus(`[Extract] ${filename}: Page ${pageNum} — text only (${nativeText.length} chars, no OCR).`);
+          pagePromises.push(Promise.resolve({ pageNum, text: nativeText }));
+          continue;
+        }
+
+        // ── Step 3: OCR each embedded image (not the full page!) ──
+        _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} — ${images.length} image(s) detected, OCR-ing images only...`);
+
+        const imageOcrJobs = [];
+        for (const img of images) {
+          try {
+            const canvas = paintImageToCanvas(img.data);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            canvas.width = 0;
+            canvas.height = 0;
+
+            imageOcrJobs.push(
+              scheduler.addJob('recognize', dataUrl)
+                .then(r => r.data.text.trim())
+                .catch(err => {
+                  console.warn(`[Offscreen] Image OCR failed (${img.width}x${img.height}):`, err?.message);
+                  return '';
+                })
+            );
+          } catch (paintErr) {
+            console.warn(`[Offscreen] Image paint failed (${img.width}x${img.height}):`, paintErr?.message);
+          }
+        }
+
+        // Wrap all image OCR jobs for this page into a single promise
+        const pNum = pageNum;
+        const pNative = nativeText;
+        pagePromises.push(
+          Promise.all(imageOcrJobs).then(imageTexts => {
+            _ocrPagesCompleted++;
+            const imageOcrText = imageTexts.filter(t => t.length > 0).join('\n');
+            const combined = imageOcrText ? `${pNative}\n${imageOcrText}` : pNative;
+            _sendOcrStatus(`[Extract] ${filename}: ${_ocrPagesCompleted}/${_ocrPagesTotal} pages complete.`);
+            return { pageNum: pNum, text: combined };
+          })
+        );
+        imageOcrSucceeded = true;
+
+      } catch (imgErr) {
+        // Image extraction API failed — fall back to full-page OCR
+        console.warn(`[Offscreen] Page ${pageNum} image extraction failed:`, imgErr?.message);
+        _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} — image extraction unavailable, using full-page OCR...`);
+      }
+
+      // ── Fallback: full-page render + OCR if image extraction failed ──
+      if (!imageOcrSucceeded) {
+        const pNum = pageNum;
+        pagePromises.push(
+          _fullPageOcr(page, scheduler, filename, pageNum)
+            .then(text => {
+              _ocrPagesCompleted++;
+              _sendOcrStatus(`[OCR] ${filename}: ${_ocrPagesCompleted}/${_ocrPagesTotal} pages complete (fallback).`);
+              return { pageNum: pNum, text };
+            })
+            .catch(err => {
+              _ocrPagesCompleted++;
+              console.warn(`[Offscreen] Page ${pNum} full-page OCR failed:`, err?.message);
+              return { pageNum: pNum, text: `[Page ${pNum} Extraction Failed]` };
+            })
+        );
+      }
+
     } catch (pageErr) {
-      console.warn(`[Offscreen] Page ${pageNum} failed:`, pageErr?.message);
-      _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} FAILED: ${pageErr?.message}`);
-      rawPages.push(`[Page ${pageNum} OCR Failed]`);
+      _ocrPagesCompleted++;
+      console.warn(`[Offscreen] Page ${pageNum} failed entirely:`, pageErr?.message);
+      _sendOcrStatus(`[Extract] ${filename}: Page ${pageNum} FAILED: ${pageErr?.message}`);
+      pagePromises.push(Promise.resolve({ pageNum, text: `[Page ${pageNum} Extraction Failed]` }));
     }
   }
 
-  const raw = rawPages.join('\n\n');
+  // Wait for all page results (image OCR jobs run in parallel across workers)
+  const results = await Promise.all(pagePromises);
+
+  // Sort by page number (results may complete out of order)
+  results.sort((a, b) => a.pageNum - b.pageNum);
+
+  const raw = results.map(r => r.text).join('\n\n');
   const cleaned = cleanExtractedText(raw);
-  
+
+  _sendOcrStatus(`[Extract] ${filename}: All ${pdf.numPages} pages complete.`);
+
   return { text: cleaned, isScanned: false, isPasswordProtected: false };
 }
 
 // ─── Image OCR extraction ────────────────────────────────────────────────────
 async function extractImageText(uint8Array, mimeType, filename) {
   currentOcrFilename = filename || 'Image';
-  totalOcrPages = 1;
-  currentOcrPage = 1;
-  lastReportedPercent = -1;
+  _ocrPagesCompleted = 0;
+  _ocrPagesTotal = 1;
 
   const blob = new Blob([uint8Array], { type: mimeType });
   const url = URL.createObjectURL(blob);
-  
+
   try {
     const img = new Image();
     img.src = url;
@@ -241,11 +485,11 @@ async function extractImageText(uint8Array, mimeType, filename) {
     const context = canvas.getContext('2d');
     context.drawImage(img, 0, 0);
 
-    const worker = await getTesseractWorker();
-    const result = await worker.recognize(canvas);
+    const scheduler = await getTesseractScheduler();
+    const result = await scheduler.addJob('recognize', canvas);
     const ocrText = result.data.text.trim();
     const cleaned = cleanExtractedText(ocrText);
-    
+
     return { text: cleaned };
   } finally {
     URL.revokeObjectURL(url);
