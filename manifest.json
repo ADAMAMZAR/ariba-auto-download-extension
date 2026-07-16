@@ -73,8 +73,6 @@
     {
       "resources": [
         "pdf_pipeline/*",
-        "node_modules/tesseract.js/dist/*",
-        "node_modules/tesseract.js-core/*",
         "tessdata/*"
       ],
       "matches": [

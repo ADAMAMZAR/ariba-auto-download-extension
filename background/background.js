@@ -742,7 +742,7 @@ async function maybeOpenGemini(supplier, filesForGemini = []) {
     await clearState(supplier);
   }
 
-  notifyPanel('Opening Gemini Gem...');
+  notifyPanel('Opening Gemini Gem in background...');
   const tab = await chrome.tabs.create({ url: state.config.geminiUrl });
 
   // Attach chrome.debugger to log network upload requests directly from the tab
@@ -860,8 +860,8 @@ async function maybeOpenNotebookLM(supplier, filesForNlm = []) {
     await clearState(supplier);
   }
 
-  notifyPanel('Opening NotebookLM...');
-  const tab = await chrome.tabs.create({ url: state.config.nlmUrl });
+  notifyPanel('Opening NotebookLM in background...');
+  const tab = await chrome.tabs.create({ url: state.config.nlmUrl, active: false });
 
   // Wait for the page to fully load, then inject the runner script
   let fired = false;
@@ -1471,7 +1471,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const compiledDataUrl = `data:text/plain;charset=utf-8;base64,${base64Compiled}`;
 
             const compiledFilename = `${s} - Extracted_Data.txt`;
-             if (uploadEnabled) {
+            if (uploadEnabled) {
               filesForGemini.push({
                 filename: compiledFilename,
                 dataUrl: compiledDataUrl,
@@ -1533,7 +1533,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
             const qaFilename = `${s} - QA_Data.md`;
 
-             if (uploadEnabled) {
+            if (uploadEnabled) {
               filesForGemini.push({
                 filename: qaFilename,
                 dataUrl: dataUrl,
@@ -1658,7 +1658,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // code programmatically every time a NotebookLM tab loads.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete' && tab.url && tab.url.includes('notebooklm.google.com')) {
-    
+
     // Inject CSS
     chrome.scripting.insertCSS({
       target: { tabId },
@@ -1692,13 +1692,13 @@ const activeRequestLogs = {};
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
-  
+
   if (method === 'Network.requestWillBeSent') {
     const url = params.request.url;
-    const isUploadRequest = url.includes('clients6.google.com') || 
-                            url.includes('push.clients6.google.com') ||
-                            url.includes('BardChatUi/data/batchexecute');
-    
+    const isUploadRequest = url.includes('clients6.google.com') ||
+      url.includes('push.clients6.google.com') ||
+      url.includes('BardChatUi/data/batchexecute');
+
     if (isUploadRequest) {
       if (!activeRequestLogs[tabId]) {
         activeRequestLogs[tabId] = {};
@@ -1734,7 +1734,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           chrome.runtime.sendMessage({
             action: 'logNetworkData',
             logData: JSON.stringify(logData, null, 2)
-          }).catch(() => {});
+          }).catch(() => { });
 
           // Clean up this request
           if (activeRequestLogs[source.tabId]) {

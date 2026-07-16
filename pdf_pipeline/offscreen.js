@@ -184,142 +184,186 @@ function textContentToString(textContent) {
 }
 
 /**
- * Extract embedded image objects from a PDF page via the operator list.
- * Returns only images large enough to potentially contain text (≥ 30×30 px).
- * Falls back to empty array if the API is unavailable or fails.
+ * Scans the canvas for continuous horizontal and vertical lines (box borders)
+ * and paints them white. This prevents Tesseract from dropping text that is
+ * enclosed inside graphical boxes.
  */
-async function getPageImages(page) {
-  if (!page.objs || typeof page.objs.get !== 'function') return [];
+function removeBoxLines(ctx, width, height) {
+  const imgData = ctx.getImageData(0, 0, width, height);
+  const data = imgData.data;
+  
+  // Consider pixel black/dark if all RGB values are < 150
+  const isBlack = (idx) => data[idx] < 150 && data[idx+1] < 150 && data[idx+2] < 150;
+  const setWhite = (idx) => { data[idx] = 255; data[idx+1] = 255; data[idx+2] = 255; };
 
-  const ops = await page.getOperatorList();
-  const IMAGE_OPS = new Set([
-    pdfjsLib.OPS.paintImageXObject,
-    pdfjsLib.OPS.paintJpegXObject,
-    pdfjsLib.OPS.paintImageXObjectRepeat,
-  ]);
+  // A run of >200 dark pixels is a drawn line/border. (200px is ~0.6 inches, safe for fonts)
+  const MIN_LINE_LENGTH = 200; 
 
-  // Collect unique image names referenced by paint operations
-  const seenNames = new Set();
-  for (let i = 0; i < ops.fnArray.length; i++) {
-    if (IMAGE_OPS.has(ops.fnArray[i])) {
-      seenNames.add(ops.argsArray[i][0]);
-    }
-  }
-  if (seenNames.size === 0) return [];
-
-  // Load image data for each unique image
-  const images = [];
-  for (const imgName of seenNames) {
-    try {
-      const imgData = await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('timeout')), 10000);
-        page.objs.get(imgName, (data) => { clearTimeout(timeout); resolve(data); });
-      });
-
-      // Determine dimensions (handle ImageBitmap vs raw pixel data)
-      let width, height;
-      if (imgData instanceof ImageBitmap) {
-        width = imgData.width; height = imgData.height;
-      } else if (imgData?.bitmap instanceof ImageBitmap) {
-        width = imgData.bitmap.width; height = imgData.bitmap.height;
-      } else if (imgData?.width && imgData?.height) {
-        width = imgData.width; height = imgData.height;
+  // 1. Erase horizontal lines
+  for (let y = 0; y < height; y++) {
+    let runStart = -1;
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      if (isBlack(idx)) {
+        if (runStart === -1) runStart = x;
       } else {
-        continue; // Unknown format, skip
+        if (runStart !== -1) {
+          if (x - runStart >= MIN_LINE_LENGTH) {
+            for (let k = runStart; k < x; k++) {
+              setWhite((y * width + k) * 4);
+            }
+          }
+          runStart = -1;
+        }
       }
-
-      // Skip tiny images (decorative borders, spacers, styling blocks)
-      if (width < 30 || height < 30 || width * height < 2500) continue;
-
-      images.push({ name: imgName, data: imgData, width, height });
-    } catch (err) {
-      console.warn(`[Offscreen] Couldn't load image ${imgName}:`, err?.message);
+    }
+    if (runStart !== -1 && width - runStart >= MIN_LINE_LENGTH) {
+      for (let k = runStart; k < width; k++) {
+        setWhite((y * width + k) * 4);
+      }
     }
   }
-  return images;
+
+  // 2. Erase vertical lines
+  for (let x = 0; x < width; x++) {
+    let runStart = -1;
+    for (let y = 0; y < height; y++) {
+      const idx = (y * width + x) * 4;
+      if (isBlack(idx)) {
+        if (runStart === -1) runStart = y;
+      } else {
+        if (runStart !== -1) {
+          if (y - runStart >= MIN_LINE_LENGTH) {
+            for (let k = runStart; k < y; k++) {
+              setWhite((k * width + x) * 4);
+            }
+          }
+          runStart = -1;
+        }
+      }
+    }
+    if (runStart !== -1 && height - runStart >= MIN_LINE_LENGTH) {
+      for (let k = runStart; k < height; k++) {
+        setWhite((k * width + x) * 4);
+      }
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
 }
 
 /**
- * Paint a pdf.js image object onto a canvas for OCR.
- * Handles ImageBitmap (modern pdf.js) and raw pixel data (RGBA/RGB/1BPP).
+ * Render the page, paint white rectangles over all native text, crop the remaining 
+ * graphics (logos/signatures), and OCR only that cropped region.
  */
-function paintImageToCanvas(imgData) {
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-
-  // Handle ImageBitmap (modern pdf.js with OffscreenCanvas support)
-  if (imgData instanceof ImageBitmap || imgData?.bitmap instanceof ImageBitmap) {
-    const bmp = imgData instanceof ImageBitmap ? imgData : imgData.bitmap;
-    canvas.width = bmp.width;
-    canvas.height = bmp.height;
-    ctx.drawImage(bmp, 0, 0);
-    return canvas;
-  }
-
-  // Handle raw pixel data
-  const { width, height, data, kind } = imgData;
-  if (!data || !width || !height) throw new Error('Invalid image data');
-
-  canvas.width = width;
-  canvas.height = height;
-  const pixels = width * height;
-
-  let rgba;
-  if (kind === 3 || data.length === pixels * 4) {
-    // RGBA_32BPP
-    rgba = data instanceof Uint8ClampedArray ? data : new Uint8ClampedArray(data);
-  } else if (kind === 2 || data.length === pixels * 3) {
-    // RGB_24BPP → RGBA
-    rgba = new Uint8ClampedArray(pixels * 4);
-    for (let s = 0, d = 0; s < data.length; s += 3, d += 4) {
-      rgba[d] = data[s]; rgba[d+1] = data[s+1]; rgba[d+2] = data[s+2]; rgba[d+3] = 255;
-    }
-  } else if (kind === 1) {
-    // GRAYSCALE_1BPP — each bit is a pixel (packed 8 per byte)
-    rgba = new Uint8ClampedArray(pixels * 4);
-    for (let i = 0; i < pixels; i++) {
-      const v = ((data[i >> 3] >> (7 - (i & 7))) & 1) ? 0 : 255;
-      rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = v; rgba[i*4+3] = 255;
-    }
-  } else if (data.length === pixels) {
-    // Grayscale 8bpp
-    rgba = new Uint8ClampedArray(pixels * 4);
-    for (let i = 0; i < pixels; i++) {
-      rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = data[i]; rgba[i*4+3] = 255;
-    }
-  } else {
-    // Unknown format — best effort as RGBA
-    rgba = data instanceof Uint8ClampedArray ? data : new Uint8ClampedArray(data);
-  }
-
-  ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
-  return canvas;
-}
-
-/**
- * Full-page OCR fallback — renders the entire page to canvas and OCRs it.
- * Used when image extraction fails for a page.
- */
-async function _fullPageOcr(page, scheduler, filename, pageNum) {
+async function renderAndMaskPage(page, textContent, scheduler, filename, pageNum) {
   const baseViewport = page.getViewport({ scale: 1.0 });
-  const scale = (baseViewport.width >= 1500 || baseViewport.height >= 2000) ? 1.0 : 1.5;
+  
+  // Tesseract requires ~300 DPI for accurate OCR on small text.
+  // Standard A4 in PDF points is 595px wide. 300 DPI means we need a canvas ~2500px wide.
+  let scale = 2500 / baseViewport.width;
+  // Clamp scale between 2.0 and 5.0 to prevent memory crashes on unusually large/small PDFs
+  if (scale < 2.0) scale = 2.0;
+  if (scale > 5.0) scale = 5.0;
+  
   const viewport = page.getViewport({ scale });
 
   const canvas = document.createElement('canvas');
   canvas.width = viewport.width;
   canvas.height = viewport.height;
-  const ctx = canvas.getContext('2d');
+  // willReadFrequently optimizes getImageData performance
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
+  // 1. Render the full page (images + text)
   const renderPromise = page.render({ canvasContext: ctx, viewport }).promise;
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error('page.render() timed out after 60s')), 60000)
   );
   await Promise.race([renderPromise, timeoutPromise]);
 
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-  canvas.width = 0;
-  canvas.height = 0;
+  // 2. Mask out all native text with white rectangles
+  ctx.fillStyle = 'white';
+  for (const item of textContent.items) {
+    if (!item.str || item.str.trim() === '') continue;
 
+    // The baseline coordinates in PDF points
+    const tx = item.transform[4];
+    const ty = item.transform[5];
+    
+    // Convert to canvas coordinates
+    const [canvasX, canvasY] = viewport.convertToViewportPoint(tx, ty);
+    
+    // transform[3] is the unscaled font height
+    const pdfFontHeight = Math.abs(item.transform[3]);
+    const fontHeight = pdfFontHeight * viewport.scale;
+    const fontWidth = item.width * viewport.scale;
+    
+    ctx.fillRect(
+      canvasX, 
+      canvasY - fontHeight, 
+      fontWidth, 
+      fontHeight
+    );
+  }
+
+  // 2.5 Image Processing: Erase drawn box borders so Tesseract doesn't get confused
+  removeBoxLines(ctx, canvas.width, canvas.height);
+
+  // 3. Find bounding box of remaining non-white pixels
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  let minX = canvas.width, minY = canvas.height, maxX = 0, maxY = 0;
+  let hasPixels = false;
+  
+  for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+          const idx = (y * canvas.width + x) * 4;
+          const r = imgData[idx];
+          const g = imgData[idx+1];
+          const b = imgData[idx+2];
+          
+          // Check if NOT white (allow tolerance for JPEG artifacts/off-white backgrounds)
+          if (r < 250 || g < 250 || b < 250) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+              hasPixels = true;
+          }
+      }
+  }
+
+  if (!hasPixels) {
+    // Nothing left on page after erasing text! No OCR needed!
+    return '';
+  }
+
+  // 4. Crop the canvas to the bounding box
+  const pad = 20;
+  minX = Math.max(0, minX - pad);
+  minY = Math.max(0, minY - pad);
+  maxX = Math.min(canvas.width, maxX + pad);
+  maxY = Math.min(canvas.height, maxY + pad);
+  
+  const cropW = maxX - minX;
+  const cropH = maxY - minY;
+
+  const cropCanvas = document.createElement('canvas');
+  cropCanvas.width = cropW;
+  cropCanvas.height = cropH;
+  const cropCtx = cropCanvas.getContext('2d');
+  cropCtx.drawImage(canvas, minX, minY, cropW, cropH, 0, 0, cropW, cropH);
+  
+  // Use lossless PNG instead of JPEG to prevent compression artifacts from ruining OCR!
+  const dataUrl = cropCanvas.toDataURL('image/png');
+  
+  // Debug output: sends the exact masked crop to the side panel
+  chrome.runtime.sendMessage({
+    type: 'DEBUG_SAVE_IMAGE',
+    dataUrl: dataUrl,
+    filename: `test_${filename}_page_${pageNum}_masked_crop.png`
+  }).catch(() => {});
+
+  // 5. OCR the cropped image
   const result = await scheduler.addJob('recognize', dataUrl);
   return result.data.text.trim();
 }
@@ -343,10 +387,6 @@ async function extractText(uint8Array, filename) {
   _ocrPagesTotal = pdf.numPages;
 
   const scheduler = await getTesseractScheduler();
-
-  // Each page becomes a Promise that resolves to { pageNum, text }.
-  // Native text extraction is synchronous per page, but image OCR jobs are
-  // submitted to the scheduler in parallel across all pages and workers.
   const pagePromises = [];
 
   _sendOcrStatus(`[Extract] ${filename}: Processing ${pdf.numPages} pages...`);
@@ -355,90 +395,58 @@ async function extractText(uint8Array, filename) {
     try {
       const page = await pdf.getPage(pageNum);
 
-      // ── Step 1: Native text extraction (instant, 100% accurate) ──
+      // ── Step 1: Native text extraction ──
       let nativeText = '';
+      let textContent = null;
       try {
         _sendOcrStatus(`[Extract] ${filename}: Page ${pageNum}/${pdf.numPages} — extracting native text...`);
-        const textContent = await page.getTextContent();
+        textContent = await page.getTextContent();
         nativeText = textContentToString(textContent);
+        
+        // Extract text from fillable form fields (Widget annotations) which getTextContent ignores!
+        try {
+          const annotations = await page.getAnnotations();
+          const formValues = annotations
+            .filter(a => a.subtype === 'Widget' && a.fieldValue)
+            .map(a => a.fieldValue)
+            .join(' ');
+          if (formValues) {
+            nativeText += (nativeText ? ' ' : '') + formValues;
+          }
+        } catch(annoErr) {
+          console.warn(`[Offscreen] Page ${pageNum} annotation extraction failed:`, annoErr?.message);
+        }
       } catch (e) {
         console.warn(`[Offscreen] Page ${pageNum} native text failed:`, e?.message);
       }
 
-      // ── Step 2: Detect and extract embedded images ──
-      let imageOcrSucceeded = false;
-      try {
-        const images = await getPageImages(page);
+      // ── Step 2: Render & Mask Image OCR ──
+      const pNum = pageNum;
+      const pNative = nativeText;
+      const tc = textContent || { items: [] };
 
-        if (images.length === 0) {
-          // Fast path — no images, native text only (zero OCR needed!)
-          _ocrPagesCompleted++;
-          _sendOcrStatus(`[Extract] ${filename}: Page ${pageNum} — text only (${nativeText.length} chars, no OCR).`);
-          pagePromises.push(Promise.resolve({ pageNum, text: nativeText }));
-          continue;
-        }
-
-        // ── Step 3: OCR each embedded image (not the full page!) ──
-        _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} — ${images.length} image(s) detected, OCR-ing images only...`);
-
-        const imageOcrJobs = [];
-        for (const img of images) {
-          try {
-            const canvas = paintImageToCanvas(img.data);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-            canvas.width = 0;
-            canvas.height = 0;
-
-            imageOcrJobs.push(
-              scheduler.addJob('recognize', dataUrl)
-                .then(r => r.data.text.trim())
-                .catch(err => {
-                  console.warn(`[Offscreen] Image OCR failed (${img.width}x${img.height}):`, err?.message);
-                  return '';
-                })
-            );
-          } catch (paintErr) {
-            console.warn(`[Offscreen] Image paint failed (${img.width}x${img.height}):`, paintErr?.message);
-          }
-        }
-
-        // Wrap all image OCR jobs for this page into a single promise
-        const pNum = pageNum;
-        const pNative = nativeText;
-        pagePromises.push(
-          Promise.all(imageOcrJobs).then(imageTexts => {
+      pagePromises.push(
+        renderAndMaskPage(page, tc, scheduler, filename, pNum)
+          .then(imageOcrText => {
             _ocrPagesCompleted++;
-            const imageOcrText = imageTexts.filter(t => t.length > 0).join('\n');
-            const combined = imageOcrText ? `${pNative}\n${imageOcrText}` : pNative;
+            
+            let combined = pNative;
+            if (imageOcrText) {
+                // Combine native text and the OCR'd logo text
+                combined = pNative ? `${pNative}\n[Image OCR]:\n${imageOcrText}` : `[Image OCR]:\n${imageOcrText}`;
+            }
+            
             _sendOcrStatus(`[Extract] ${filename}: ${_ocrPagesCompleted}/${_ocrPagesTotal} pages complete.`);
             return { pageNum: pNum, text: combined };
           })
-        );
-        imageOcrSucceeded = true;
-
-      } catch (imgErr) {
-        // Image extraction API failed — fall back to full-page OCR
-        console.warn(`[Offscreen] Page ${pageNum} image extraction failed:`, imgErr?.message);
-        _sendOcrStatus(`[OCR] ${filename}: Page ${pageNum} — image extraction unavailable, using full-page OCR...`);
-      }
-
-      // ── Fallback: full-page render + OCR if image extraction failed ──
-      if (!imageOcrSucceeded) {
-        const pNum = pageNum;
-        pagePromises.push(
-          _fullPageOcr(page, scheduler, filename, pageNum)
-            .then(text => {
-              _ocrPagesCompleted++;
-              _sendOcrStatus(`[OCR] ${filename}: ${_ocrPagesCompleted}/${_ocrPagesTotal} pages complete (fallback).`);
-              return { pageNum: pNum, text };
-            })
-            .catch(err => {
-              _ocrPagesCompleted++;
-              console.warn(`[Offscreen] Page ${pNum} full-page OCR failed:`, err?.message);
-              return { pageNum: pNum, text: `[Page ${pNum} Extraction Failed]` };
-            })
-        );
-      }
+          .catch(err => {
+             _ocrPagesCompleted++;
+             console.warn(`[Offscreen] Page ${pNum} Render & Mask OCR failed:`, err?.message);
+             // If image OCR fails, we STILL keep the perfect native text!
+             const fallbackText = pNative ? `${pNative}\n[Image OCR Failed]` : `[Page ${pNum} Extraction Failed]`;
+             return { pageNum: pNum, text: fallbackText };
+          })
+      );
 
     } catch (pageErr) {
       _ocrPagesCompleted++;
@@ -454,12 +462,16 @@ async function extractText(uint8Array, filename) {
   // Sort by page number (results may complete out of order)
   results.sort((a, b) => a.pageNum - b.pageNum);
 
-  const raw = results.map(r => r.text).join('\n\n');
-  const cleaned = cleanExtractedText(raw);
+  const finalPages = results.map(r => {
+    const cleanedText = cleanExtractedText(r.text);
+    return `--- Page ${r.pageNum} ---\n${cleanedText}`;
+  });
+
+  const finalCombinedText = finalPages.join('\n\n');
 
   _sendOcrStatus(`[Extract] ${filename}: All ${pdf.numPages} pages complete.`);
 
-  return { text: cleaned, isScanned: false, isPasswordProtected: false };
+  return { text: finalCombinedText, isScanned: false, isPasswordProtected: false };
 }
 
 // ─── Image OCR extraction ────────────────────────────────────────────────────

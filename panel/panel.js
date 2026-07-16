@@ -250,6 +250,49 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // ── Test OCR ────────────────────────────────────────────────────────────────
+  const testOcrBtn = document.getElementById('test-ocr-btn');
+  const testOcrFile = document.getElementById('test-ocr-file');
+
+  if (testOcrBtn && testOcrFile) {
+    testOcrBtn.addEventListener('click', async () => {
+      const file = testOcrFile.files[0];
+      if (!file) {
+        addLog('Please select a PDF file first.', 'error');
+        return;
+      }
+      
+      const testImageContainer = document.getElementById('test-image-container');
+      if (testImageContainer) testImageContainer.innerHTML = '';
+      
+      testOcrBtn.disabled = true;
+      addLog(`[Test] Starting extraction for ${file.name}...`, 'info');
+      
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        
+        // Use the global function imported from pdf_extractor.js
+        const result = await extractTextFromPdfBuffer(arrayBuffer, file.name);
+        
+        if (result && result.text && !result.text.includes('EXTRACTION_BLOCKED')) {
+          addLog('[Test] Extraction complete. Downloading result...', 'done');
+          const blob = new Blob([result.text], { type: 'text/plain' });
+          const url = URL.createObjectURL(blob);
+          chrome.downloads.download({
+            url: url,
+            filename: `test_output/${file.name}_result.txt`
+          });
+        } else {
+          addLog(`[Test] Extraction failed or blocked.`, 'error');
+        }
+      } catch (err) {
+        addLog(`[Test] Error: ${err.message}`, 'error');
+      } finally {
+        testOcrBtn.disabled = false;
+      }
+    });
+  }
+
   // Listen for status messages from content / background
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'status') {
@@ -262,6 +305,30 @@ document.addEventListener('DOMContentLoaded', () => {
       if (networkLogBox) {
         networkLogBox.value += `\n=== NEW NETWORK REQUEST ===\n${message.logData}\n`;
         networkLogBox.scrollTop = networkLogBox.scrollHeight;
+      }
+    } else if (message.type === 'DEBUG_SAVE_IMAGE') {
+      const container = document.getElementById('test-image-container');
+      if (container) {
+        const wrapper = document.createElement('div');
+        wrapper.style.border = '1px solid #444';
+        wrapper.style.padding = '5px';
+        wrapper.style.background = '#222';
+        
+        const label = document.createElement('div');
+        label.textContent = message.filename;
+        label.style.fontSize = '10px';
+        label.style.marginBottom = '5px';
+        label.style.wordBreak = 'break-all';
+        
+        const img = document.createElement('img');
+        img.src = message.dataUrl;
+        img.style.maxWidth = '100%';
+        img.style.display = 'block';
+        img.style.background = '#fff'; // show transparent bg clearly
+        
+        wrapper.appendChild(label);
+        wrapper.appendChild(img);
+        container.appendChild(wrapper);
       }
     }
   });

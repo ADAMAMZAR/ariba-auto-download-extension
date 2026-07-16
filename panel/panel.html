@@ -18,7 +18,8 @@
 
     <button id="download-btn">Download Attachments</button>
     <button id="stop-btn" class="btn-danger" style="display:none;">⏹ Stop</button>
-    <button id="clear-cache-btn" class="btn-secondary" style="margin-top: 5px; margin-bottom: 10px; width: 100%;">Clear Extension Cache</button>
+    <button id="clear-cache-btn" class="btn-secondary" style="margin-top: 5px; margin-bottom: 10px; width: 100%;">Clear
+      Extension Cache</button>
 
     <div class="checkbox-group">
       <input type="checkbox" id="connect-auto-upload" checked />
@@ -28,21 +29,25 @@
     <div id="upload-settings-container">
       <div class="radio-group-container" style="margin-top: 10px; margin-bottom: 10px;">
         <label style="font-weight: bold; display: block; margin-bottom: 5px; font-size: 0.95em;">Upload Target:</label>
-        
+
         <div class="radio-option" style="margin-bottom: 5px; display: flex; align-items: center;">
-          <input type="radio" id="target-gemini" name="upload-target" value="gemini" checked style="margin-right: 6px;" />
-          <label for="target-gemini" style="cursor: pointer;">Gemini Gem <span style="color: #4caf50; font-size: 0.9em; font-weight: bold;">(Recommended)</span></label>
+          <input type="radio" id="target-gemini" name="upload-target" value="gemini" checked
+            style="margin-right: 6px;" />
+          <label for="target-gemini" style="cursor: pointer;">Gemini Gem <span
+              style="color: #4caf50; font-size: 0.9em; font-weight: bold;">(Recommended)</span></label>
         </div>
-        
+
         <div class="radio-option" style="margin-bottom: 8px; display: flex; align-items: center;">
           <input type="radio" id="target-nlm" name="upload-target" value="nlm" style="margin-right: 6px;" />
-          <label for="target-nlm" style="cursor: pointer;">NotebookLM <span style="color: #ff9800; font-size: 0.9em; font-weight: bold;">(Legacy)</span></label>
+          <label for="target-nlm" style="cursor: pointer;">NotebookLM <span
+              style="color: #ff9800; font-size: 0.9em; font-weight: bold;">(Legacy)</span></label>
         </div>
       </div>
 
       <div class="input-group" id="nlm-url-group" style="display: none; margin-bottom: 10px;">
         <label for="nlm-notebook-url" style="font-size: 0.9em;">NotebookLM Notebook URL</label>
-        <input type="text" id="nlm-notebook-url" placeholder="https://notebooklm.google.com/notebook/..." style="width: 100%; box-sizing: border-box; padding: 6px;" />
+        <input type="text" id="nlm-notebook-url" placeholder="https://notebooklm.google.com/notebook/..."
+          style="width: 100%; box-sizing: border-box; padding: 6px;" />
       </div>
 
       <div class="checkbox-group" style="margin-top: 5px;">
@@ -68,10 +73,21 @@
 
     <div class="input-group" style="margin-top: 15px;">
       <label for="network-log-box">Network Upload Log (Click to copy)</label>
-      <textarea id="network-log-box" rows="8" readonly style="width: 100%; font-family: monospace; font-size: 10px; background: #1e1e1e; color: #0f0; border: 1px solid #333; padding: 5px; box-sizing: border-box;" placeholder="Network log for push.clients6.google.com will appear here..."></textarea>
+      <textarea id="network-log-box" rows="8" readonly
+        style="width: 100%; font-family: monospace; font-size: 10px; background: #1e1e1e; color: #0f0; border: 1px solid #333; padding: 5px; box-sizing: border-box;"
+        placeholder="Network log for push.clients6.google.com will appear here..."></textarea>
+    </div>
+    <div class="test-ocr-group" style="margin-top: 15px; border: 1px dashed #ccc; padding: 10px;">
+      <label style="font-weight: bold; display: block; margin-bottom: 5px;">Test OCR (Temporary)</label>
+      <input type="file" id="test-ocr-file" accept="application/pdf" style="margin-bottom: 5px; width: 100%;" />
+      <button id="test-ocr-btn" class="btn-secondary">Test Extraction & Display Images</button>
+      <div id="test-image-container"
+        style="margin-top: 10px; display: flex; flex-direction: column; gap: 10px; max-height: 400px; overflow-y: auto;">
+      </div>
     </div>
   </div>
   <script src="../shared/constants.js"></script>
+  <script src="../pdf_pipeline/pdf_extractor.js"></script>
   <script src="panel.js"></script>
 </body>
 
