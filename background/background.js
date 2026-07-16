@@ -745,29 +745,6 @@ async function maybeOpenGemini(supplier, filesForGemini = []) {
   notifyPanel('Opening Gemini Gem in background...');
   const tab = await chrome.tabs.create({ url: state.config.geminiUrl });
 
-  // Attach chrome.debugger to log network upload requests directly from the tab
-  const debuggerTarget = { tabId: tab.id };
-  chrome.debugger.attach(debuggerTarget, '1.3', () => {
-    if (chrome.runtime.lastError) {
-      console.warn('[Ariba Ext] Failed to attach debugger:', chrome.runtime.lastError.message);
-      return;
-    }
-    chrome.debugger.sendCommand(debuggerTarget, 'Network.enable', {}, () => {
-      if (chrome.runtime.lastError) {
-        console.warn('[Ariba Ext] Failed to enable Network domain:', chrome.runtime.lastError.message);
-      }
-    });
-  });
-
-  // Clean up debugger when tab is closed
-  const tabRemovedListener = (removedTabId) => {
-    if (removedTabId === tab.id) {
-      chrome.debugger.detach(debuggerTarget, () => { chrome.runtime.lastError; });
-      chrome.tabs.onRemoved.removeListener(tabRemovedListener);
-    }
-  };
-  chrome.tabs.onRemoved.addListener(tabRemovedListener);
-
   // Wait for the page to fully load, then inject the runner script
   let fired = false;
   chrome.tabs.onUpdated.addListener(async function listener(tabId, info) {
@@ -1634,6 +1611,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // Clear any stale session state so the next run starts clean
         if (supplierKey) clearState(supplierKey).catch(() => { });
       } finally {
+        const tabId = sender.tab?.id;
+        if (tabId) chrome.tabs.sendMessage(tabId, { action: 'hideOverlay' }).catch(() => { });
         clearTimeout(timeoutHandle);
         clearStopSignal();
         // Clear the run config so onUpdateAvailable doesn't see a stale

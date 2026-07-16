@@ -214,29 +214,31 @@ document.addEventListener('DOMContentLoaded', () => {
   const reportProblemBtn = document.getElementById('report-problem-btn');
   const reportSupplierInput = document.getElementById('report-supplier');
   const reportNoteInput = document.getElementById('report-note');
-  reportProblemBtn.addEventListener('click', async () => {
-    const note = reportNoteInput.value.trim();
-    const supplier = reportSupplierInput.value.trim();
+  if (reportProblemBtn) {
+    reportProblemBtn.addEventListener('click', async () => {
+      const note = reportNoteInput.value.trim();
+      const supplier = reportSupplierInput.value.trim();
 
-    reportProblemBtn.disabled = true;
-    const originalText = reportProblemBtn.textContent;
-    reportProblemBtn.textContent = 'Sending...';
+      reportProblemBtn.disabled = true;
+      const originalText = reportProblemBtn.textContent;
+      reportProblemBtn.textContent = 'Sending...';
 
-    try {
-      const result = await chrome.runtime.sendMessage({ action: 'reportProblem', note, supplier });
-      if (result?.ok) {
-        addLog('Problem report sent. Thanks!', 'done');
-        reportNoteInput.value = '';
-      } else {
-        addLog('Report saved locally (send failed: ' + (result?.error || 'unknown error') + ').', 'error');
+      try {
+        const result = await chrome.runtime.sendMessage({ action: 'reportProblem', note, supplier });
+        if (result?.ok) {
+          addLog('Problem report sent. Thanks!', 'done');
+          reportNoteInput.value = '';
+        } else {
+          addLog('Report saved locally (send failed: ' + (result?.error || 'unknown error') + ').', 'error');
+        }
+      } catch (err) {
+        addLog('Failed to send report: ' + err.message, 'error');
+      } finally {
+        reportProblemBtn.disabled = false;
+        reportProblemBtn.textContent = originalText;
       }
-    } catch (err) {
-      addLog('Failed to send report: ' + err.message, 'error');
-    } finally {
-      reportProblemBtn.disabled = false;
-      reportProblemBtn.textContent = originalText;
-    }
-  });
+    });
+  }
 
 
   const networkLogBox = document.getElementById('network-log-box');

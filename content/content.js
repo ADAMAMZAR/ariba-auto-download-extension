@@ -45,6 +45,47 @@
       .trim();
   }
 
+  // ── Loading Overlay ───────────────────────────────────────────────────
+  function showOverlay() {
+    let overlay = document.getElementById('ariba-loading-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'ariba-loading-overlay';
+      overlay.style.cssText = `
+        position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+        background: rgba(0, 0, 0, 0.6); z-index: 999998;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        color: white; font-family: sans-serif; font-size: 20px; font-weight: 500;
+        backdrop-filter: blur(2px);
+      `;
+      
+      const spinner = document.createElement('div');
+      spinner.style.cssText = `
+        border: 4px solid rgba(255, 255, 255, 0.3); border-top: 4px solid white;
+        border-radius: 50%; width: 48px; height: 48px;
+        animation: ariba-spin 1s linear infinite; margin-bottom: 20px;
+      `;
+      
+      const style = document.createElement('style');
+      style.textContent = '@keyframes ariba-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }';
+      document.head.appendChild(style);
+
+      const text = document.createElement('div');
+      text.id = 'ariba-loading-text';
+      text.textContent = 'Processing... Please wait.';
+
+      overlay.appendChild(spinner);
+      overlay.appendChild(text);
+      document.body.appendChild(overlay);
+    }
+    overlay.style.display = 'flex';
+  }
+
+  function hideOverlay() {
+    const overlay = document.getElementById('ariba-loading-overlay');
+    if (overlay) overlay.style.display = 'none';
+  }
+
   // ── Toast notifications ───────────────────────────────────────────────
   // Styles live in content/content.css (injected via panel.js insertCSS).
   function showToast(text, isError = false) {
@@ -173,8 +214,12 @@
         const c = document.getElementById('ariba-toast-container');
         if (c) c.style.visibility = '';
       }
+      if (message.action === 'hideOverlay') {
+        hideOverlay();
+      }
       if (message.action === 'stopAutomation') {
         window.__aribaStop = true;
+        hideOverlay();
         showToast('Stopping...', false);
       }
     });
@@ -294,6 +339,7 @@
   }
 
   try {
+    showOverlay();
     showToast('Found Ariba content. Processing...');
 
     let workspaceTitle = 'Questionnaire';
@@ -474,6 +520,7 @@
     chrome.runtime.sendMessage({ action: 'downloadFiles', supplierName, rawSupplierName, workspaceTitle, files, extractedQAData });
     showToast('Files sent for download. Processing...');
   } catch (err) {
+    hideOverlay();
     if (err.message !== 'Stopped by user.') {
       showToast('Error: ' + err.message, true);
       console.error('[Ariba Ext] Error running automation:', err);
