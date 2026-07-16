@@ -85,6 +85,29 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.local.set({ deleteAfterUpload: deleteAfterUploadCheckbox.checked });
   });
 
+  const clearCacheBtn = document.getElementById('clear-cache-btn');
+  if (clearCacheBtn) {
+    clearCacheBtn.addEventListener('click', async () => {
+      clearCacheBtn.disabled = true;
+      try {
+        const keys = await chrome.storage.local.get(null);
+        const keysToRemove = Object.keys(keys).filter(key => 
+          key.startsWith('pdfTextCache_') || key.startsWith('processed_hashes_')
+        );
+        if (keysToRemove.length > 0) {
+          await chrome.storage.local.remove(keysToRemove);
+          addLog(`Successfully cleared ${keysToRemove.length} cached PDF text and hash entries.`, 'info');
+        } else {
+          addLog('No cached PDF text or deduplication entries found.', 'info');
+        }
+      } catch (err) {
+        addLog(`Failed to clear cache: ${err.message}`, 'error');
+      } finally {
+        clearCacheBtn.disabled = false;
+      }
+    });
+  }
+
   downloadBtn.addEventListener('click', async () => {
     logEntries.innerHTML = '';
     setRunning(true);
@@ -113,6 +136,7 @@ document.addEventListener('DOMContentLoaded', () => {
       addLog(`Found Ariba tab: ${aribaTab.title || aribaTab.url}`, 'info');
 
       // Store ephemeral per-run config in session storage (cleared on browser restart)
+      addLog('Saving config to session storage...', 'info');
       await chrome.storage.session.set({
         uploadConfig: { 
           connectAutoUpload, 
@@ -122,24 +146,23 @@ document.addEventListener('DOMContentLoaded', () => {
           deleteAfterUpload: deleteAfterUploadCheckbox.checked 
         }
       });
+      addLog('Config saved successfully.', 'info');
 
       // Clear any cached supplier name from a previous run to avoid stale data
+      addLog('Clearing cached supplier details...', 'info');
       await chrome.storage.local.remove(['lastSupplierName', 'lastRawSupplierName']);
 
       // Inject toast CSS before the script so classes are available on first call
+      addLog('Injecting toast stylesheet...', 'info');
       await chrome.scripting.insertCSS({
         target: { tabId: aribaTab.id, allFrames: true },
         files: ['content/content.css']
       });
+      addLog('Toast stylesheet injected.', 'info');
 
       // ── Pre-injection state reset ─────────────────────────────────────────
       // Always reset execution flags before each injection run.
-      // The Download button is disabled (setRunning) for the entire duration
-      // of a run, so a concurrent double-injection cannot happen — resetting
-      // here unconditionally is safe and ensures the re-entrant guard in
-      // content.js never silently blocks a legitimate second run.
-      // We also stamp the current version so content.js can detect stale
-      // code left behind from a previous extension version on an open tab.
+      addLog('Resetting page automation state...', 'info');
       const currentVersion = chrome.runtime.getManifest().version;
       await chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
@@ -154,13 +177,16 @@ document.addEventListener('DOMContentLoaded', () => {
         },
         args: [currentVersion]
       });
+      addLog('Page automation state reset completed.', 'info');
 
       // shared/constants.js must be injected first so sanitiseSupplierName()
       // in content.js has access to SUPPLIER_CLEAN_RULES at runtime.
+      addLog('Injecting main automation scripts...', 'info');
       await chrome.scripting.executeScript({
         target: { tabId: aribaTab.id, allFrames: true },
         files: ['shared/constants.js', 'content/content.js']
       });
+      addLog('Automation scripts successfully injected into page.', 'info');
 
     } catch (err) {
       addLog('Error: ' + err.message, 'error');
@@ -188,29 +214,31 @@ document.addEventListener('DOMContentLoaded', () => {
   const reportProblemBtn = document.getElementById('report-problem-btn');
   const reportSupplierInput = document.getElementById('report-supplier');
   const reportNoteInput = document.getElementById('report-note');
-  reportProblemBtn.addEventListener('click', async () => {
-    const note = reportNoteInput.value.trim();
-    const supplier = reportSupplierInput.value.trim();
+  if (reportProblemBtn) {
+    reportProblemBtn.addEventListener('click', async () => {
+      const note = reportNoteInput.value.trim();
+      const supplier = reportSupplierInput.value.trim();
 
-    reportProblemBtn.disabled = true;
-    const originalText = reportProblemBtn.textContent;
-    reportProblemBtn.textContent = 'Sending...';
+      reportProblemBtn.disabled = true;
+      const originalText = reportProblemBtn.textContent;
+      reportProblemBtn.textContent = 'Sending...';
 
-    try {
-      const result = await chrome.runtime.sendMessage({ action: 'reportProblem', note, supplier });
-      if (result?.ok) {
-        addLog('Problem report sent. Thanks!', 'done');
-        reportNoteInput.value = '';
-      } else {
-        addLog('Report saved locally (send failed: ' + (result?.error || 'unknown error') + ').', 'error');
+      try {
+        const result = await chrome.runtime.sendMessage({ action: 'reportProblem', note, supplier });
+        if (result?.ok) {
+          addLog('Problem report sent. Thanks!', 'done');
+          reportNoteInput.value = '';
+        } else {
+          addLog('Report saved locally (send failed: ' + (result?.error || 'unknown error') + ').', 'error');
+        }
+      } catch (err) {
+        addLog('Failed to send report: ' + err.message, 'error');
+      } finally {
+        reportProblemBtn.disabled = false;
+        reportProblemBtn.textContent = originalText;
       }
-    } catch (err) {
-      addLog('Failed to send report: ' + err.message, 'error');
-    } finally {
-      reportProblemBtn.disabled = false;
-      reportProblemBtn.textContent = originalText;
-    }
-  });
+    });
+  }
 
 
   const networkLogBox = document.getElementById('network-log-box');
@@ -220,6 +248,49 @@ document.addEventListener('DOMContentLoaded', () => {
         networkLogBox.select();
         document.execCommand('copy');
         addLog('Copied network log to clipboard!', 'info');
+      }
+    });
+  }
+
+  // ── Test OCR ────────────────────────────────────────────────────────────────
+  const testOcrBtn = document.getElementById('test-ocr-btn');
+  const testOcrFile = document.getElementById('test-ocr-file');
+
+  if (testOcrBtn && testOcrFile) {
+    testOcrBtn.addEventListener('click', async () => {
+      const file = testOcrFile.files[0];
+      if (!file) {
+        addLog('Please select a PDF file first.', 'error');
+        return;
+      }
+      
+      const testImageContainer = document.getElementById('test-image-container');
+      if (testImageContainer) testImageContainer.innerHTML = '';
+      
+      testOcrBtn.disabled = true;
+      addLog(`[Test] Starting extraction for ${file.name}...`, 'info');
+      
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        
+        // Use the global function imported from pdf_extractor.js
+        const result = await extractTextFromPdfBuffer(arrayBuffer, file.name);
+        
+        if (result && result.text && !result.text.includes('EXTRACTION_BLOCKED')) {
+          addLog('[Test] Extraction complete. Downloading result...', 'done');
+          const blob = new Blob([result.text], { type: 'text/plain' });
+          const url = URL.createObjectURL(blob);
+          chrome.downloads.download({
+            url: url,
+            filename: `test_output/${file.name}_result.txt`
+          });
+        } else {
+          addLog(`[Test] Extraction failed or blocked.`, 'error');
+        }
+      } catch (err) {
+        addLog(`[Test] Error: ${err.message}`, 'error');
+      } finally {
+        testOcrBtn.disabled = false;
       }
     });
   }
@@ -236,6 +307,30 @@ document.addEventListener('DOMContentLoaded', () => {
       if (networkLogBox) {
         networkLogBox.value += `\n=== NEW NETWORK REQUEST ===\n${message.logData}\n`;
         networkLogBox.scrollTop = networkLogBox.scrollHeight;
+      }
+    } else if (message.type === 'DEBUG_SAVE_IMAGE') {
+      const container = document.getElementById('test-image-container');
+      if (container) {
+        const wrapper = document.createElement('div');
+        wrapper.style.border = '1px solid #444';
+        wrapper.style.padding = '5px';
+        wrapper.style.background = '#222';
+        
+        const label = document.createElement('div');
+        label.textContent = message.filename;
+        label.style.fontSize = '10px';
+        label.style.marginBottom = '5px';
+        label.style.wordBreak = 'break-all';
+        
+        const img = document.createElement('img');
+        img.src = message.dataUrl;
+        img.style.maxWidth = '100%';
+        img.style.display = 'block';
+        img.style.background = '#fff'; // show transparent bg clearly
+        
+        wrapper.appendChild(label);
+        wrapper.appendChild(img);
+        container.appendChild(wrapper);
       }
     }
   });

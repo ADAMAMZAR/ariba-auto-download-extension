@@ -742,31 +742,8 @@ async function maybeOpenGemini(supplier, filesForGemini = []) {
     await clearState(supplier);
   }
 
-  notifyPanel('Opening Gemini Gem...');
+  notifyPanel('Opening Gemini Gem in background...');
   const tab = await chrome.tabs.create({ url: state.config.geminiUrl });
-
-  // Attach chrome.debugger to log network upload requests directly from the tab
-  const debuggerTarget = { tabId: tab.id };
-  chrome.debugger.attach(debuggerTarget, '1.3', () => {
-    if (chrome.runtime.lastError) {
-      console.warn('[Ariba Ext] Failed to attach debugger:', chrome.runtime.lastError.message);
-      return;
-    }
-    chrome.debugger.sendCommand(debuggerTarget, 'Network.enable', {}, () => {
-      if (chrome.runtime.lastError) {
-        console.warn('[Ariba Ext] Failed to enable Network domain:', chrome.runtime.lastError.message);
-      }
-    });
-  });
-
-  // Clean up debugger when tab is closed
-  const tabRemovedListener = (removedTabId) => {
-    if (removedTabId === tab.id) {
-      chrome.debugger.detach(debuggerTarget, () => { chrome.runtime.lastError; });
-      chrome.tabs.onRemoved.removeListener(tabRemovedListener);
-    }
-  };
-  chrome.tabs.onRemoved.addListener(tabRemovedListener);
 
   // Wait for the page to fully load, then inject the runner script
   let fired = false;
@@ -860,8 +837,8 @@ async function maybeOpenNotebookLM(supplier, filesForNlm = []) {
     await clearState(supplier);
   }
 
-  notifyPanel('Opening NotebookLM...');
-  const tab = await chrome.tabs.create({ url: state.config.nlmUrl });
+  notifyPanel('Opening NotebookLM in background...');
+  const tab = await chrome.tabs.create({ url: state.config.nlmUrl, active: false });
 
   // Wait for the page to fully load, then inject the runner script
   let fired = false;
@@ -966,7 +943,7 @@ function clearStopSignal() {
 // Message handler
 // -----------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  (async () => {
+  const handleMessage = async () => {
 
     if (request.action === 'fetchGistText') {
       try {
@@ -979,7 +956,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.type === 'status') {
-      // Relay status updates to the toast on the Ariba tab
+      // Note: chrome.runtime.sendMessage from offscreen already reaches the
+      // panel directly. We only relay to Ariba tab toasts here.
       try {
         const allData = await chrome.storage.session.get(null);
         for (const [key, val] of Object.entries(allData)) {
@@ -1069,7 +1047,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.action === 'downloadFiles') {
-      const AUTOMATION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+      const AUTOMATION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes (OCR is slow)
       let timeoutHandle;
       let supplierKey = null; // hoisted so catch block can clear session state
 
@@ -1082,7 +1060,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       // Overall timeout guard
       const timeoutPromise = new Promise((_, reject) => {
         timeoutHandle = setTimeout(() => {
-          reject(new Error('Automation timed out after 3 minutes. Please try again.'));
+          reject(new Error('Automation timed out after 10 minutes. Please try again.'));
         }, AUTOMATION_TIMEOUT_MS);
       });
 
@@ -1116,6 +1094,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const compiledTextList = [];
           const usedFilenames = new Set(); // Track filenames to guarantee uniqueness
           const seenHashes = new Map(); // hash -> filename, to skip byte-identical duplicate files this run
+          const persistentHashesKey = `processed_hashes_${s}`;
+          const storageRes = await chrome.storage.local.get(persistentHashesKey);
+          const persistentHashes = new Set(storageRes[persistentHashesKey] || []);
 
           async function processFile(idx) {
             if (stopSignal.aborted) throw new Error('Stopped by user.');
@@ -1126,6 +1107,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             let blob = null;
 
             notifyAribaTab(tabId, `Fetching file ${idx + 1}/${files.length}: ${realFilename}...`);
+            notifyPanel(`Fetching file ${idx + 1}/${files.length}: ${realFilename}...`);
 
             try {
               // We fetch the file to memory. This is required for NotebookLM, but also gives us
@@ -1163,9 +1145,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               // document under two different filenames/attachment slots).
               const arrayBuf = await blob.arrayBuffer();
               const fileHash = await hashArrayBuffer(arrayBuf);
-              if (seenHashes.has(fileHash)) {
+              if (seenHashes.has(fileHash) || persistentHashes.has(fileHash)) {
+                const dupFile = seenHashes.get(fileHash) || 'a previous run';
                 notifyAribaTab(tabId,
-                  `Skipped "${realFilename}" — identical to "${seenHashes.get(fileHash)}" (already processed).`);
+                  `Skipped "${realFilename}" — identical to "${dupFile}" (already processed for ${s}).`);
                 return;
               }
               seenHashes.set(fileHash, realFilename);
@@ -1209,16 +1192,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
               if (isPdf && typeof extractTextFromPdfBuffer === 'function') {
                 notifyAribaTab(tabId, `Extracting text from "${realFilename}"...`);
+                notifyPanel(`[OCR] Starting extraction: ${realFilename}`);
                 try {
-                  // Reuse a prior run's extraction for this exact file if we've seen it
-                  // before — skips re-parsing the PDF entirely.
                   const cachedExtraction = await getCachedPdfText(fileHash);
                   let text, isScanned, isPasswordProtected;
                   if (cachedExtraction) {
                     ({ text, isScanned, isPasswordProtected } = cachedExtraction);
                   }
 
-                  // If we have cached extraction, process immediately
                   if (cachedExtraction && text) {
                     if (isPasswordProtected) {
                       notifyAribaTab(tabId, `Skipped processing "${realFilename}" (password protected).`, true);
@@ -1252,10 +1233,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         filename: realFilename,
                         text: formattedText
                       });
+
+                      // Persist hash of successfully processed file
+                      persistentHashes.add(fileHash);
+                      await chrome.storage.local.set({ [persistentHashesKey]: Array.from(persistentHashes) });
                     }
                   } else {
-                    // Not in cache, perform fresh text extraction
-                    ({ text, isScanned, isPasswordProtected } = await extractTextFromPdfBuffer(arrayBuf));
+                    // Perform fresh local Tesseract OCR text extraction
+                    ({ text, isScanned, isPasswordProtected } = await extractTextFromPdfBuffer(arrayBuf, realFilename));
 
                     if (isPasswordProtected) {
                       notifyAribaTab(tabId, `Skipped processing "${realFilename}" (password protected).`, true);
@@ -1263,8 +1248,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         filename: realFilename,
                         text: `[DECRYPTION_BLOCKED] Password protected PDF.`
                       });
-                    } else if (!isScanned) {
-                      // ── Digital PDF: save .txt to disk + add to compilation ────
+                    } else {
                       await setCachedPdfText(fileHash, { text, isScanned: false, isPasswordProtected: false });
                       const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
                       const txtDataUrl = textToDataUrl(text);
@@ -1293,50 +1277,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         text: formattedText
                       });
 
-                    } else {
-                      // ── Scanned PDF: Call Drive OCR via Apps Script ────
-                      notifyAribaTab(tabId, `"${realFilename}" is scanned. Running remote Drive OCR...`);
-                      try {
-                        const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
-                        const ocrResult = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
-                        const ocrText = ocrResult.text;
-
-                        // Cache it
-                        await setCachedPdfText(fileHash, { text: ocrText, isScanned: true, isPasswordProtected: false });
-
-                        // Save .txt alongside original PDF on disk
-                        const txtFilename = realFilename.replace(/\.pdf$/i, '.txt');
-                        const txtDataUrl = textToDataUrl(ocrText);
-                        const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
-                        const txtDownloadId = await new Promise((resolve) => {
-                          chrome.downloads.download(
-                            { url: txtDataUrl, filename: destTxtFilename, saveAs: false },
-                            (dlId) => {
-                              if (chrome.runtime.lastError || dlId === undefined) {
-                                notifyAribaTab(tabId, `TXT (OCR) save failed for "${txtFilename}"`, true);
-                                resolve(null);
-                              } else {
-                                notifyAribaTab(tabId, `Saved TXT (OCR) → ${destTxtFilename}`);
-                                resolve(dlId);
-                              }
-                            }
-                          );
-                        });
-                        if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
-
-                        const formattedText = formatTextBlock(realFilename, ocrText);
-                        compiledTextList.push({
-                          filename: realFilename,
-                          text: formattedText
-                        });
-                      } catch (ocrErr) {
-                        console.error('[Ariba Ext] Remote OCR failed:', ocrErr);
-                        notifyAribaTab(tabId, `Remote OCR failed for "${realFilename}": ${ocrErr.message}`, true);
-                        compiledTextList.push({
-                          filename: realFilename,
-                          text: `[OCR_FAILED] Remote OCR failed: ${ocrErr.message}`
-                        });
-                      }
+                      // Persist hash of successfully processed file
+                      persistentHashes.add(fileHash);
+                      await chrome.storage.local.set({ [persistentHashesKey]: Array.from(persistentHashes) });
                     }
                   }
 
@@ -1354,15 +1297,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 // ── Non-PDF file: check if image ───────────────
                 const isImage = mimeType.includes('image') || /\.(png|jpe?g)$/i.test(realFilename);
                 if (isImage) {
-                  notifyAribaTab(tabId, `"${realFilename}" is an image. Running remote Drive OCR...`);
+                  notifyAribaTab(tabId, `"${realFilename}" is an image. Running local OCR...`);
                   try {
-                    const base64Data = uint8ArrayToBase64(new Uint8Array(arrayBuf));
-                    const ocrResult = await performDriveOcrViaAppsScript(realFilename, base64Data, mimeType);
-                    const ocrText = ocrResult.text;
+                    let text = '';
+                    const cachedExtraction = await getCachedPdfText(fileHash);
+                    if (cachedExtraction && cachedExtraction.text) {
+                      text = cachedExtraction.text;
+                      notifyAribaTab(tabId, `Using cached OCR for "${realFilename}" (seen before).`);
+                    } else {
+                      const ocrResult = await extractTextFromImageBuffer(arrayBuf, mimeType, realFilename);
+                      text = ocrResult.text;
+                      await setCachedPdfText(fileHash, { text, isScanned: true, isPasswordProtected: false });
+                    }
 
                     // Save .txt alongside original image on disk
                     const txtFilename = realFilename.replace(/\.(png|jpe?g)$/i, '.txt');
-                    const txtDataUrl = textToDataUrl(ocrText);
+                    const txtDataUrl = textToDataUrl(text);
                     const destTxtFilename = `${DOWNLOAD_ROOT}/${s}/${s} - ${cleanName(txtFilename)}`;
                     const txtDownloadId = await new Promise((resolve) => {
                       chrome.downloads.download(
@@ -1379,17 +1329,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     });
                     if (txtDownloadId != null) diskDownloadIds.push(txtDownloadId);
 
-                    const formattedText = formatTextBlock(realFilename, ocrText);
+                    const formattedText = formatTextBlock(realFilename, text);
                     compiledTextList.push({
                       filename: realFilename,
                       text: formattedText
                     });
+
+                    // Persist hash of successfully processed file
+                    persistentHashes.add(fileHash);
+                    await chrome.storage.local.set({ [persistentHashesKey]: Array.from(persistentHashes) });
                   } catch (ocrErr) {
-                    console.error('[Ariba Ext] Remote OCR failed:', ocrErr);
-                    notifyAribaTab(tabId, `Remote OCR failed for "${realFilename}": ${ocrErr.message}`, true);
+                    console.error('[Ariba Ext] Local image OCR failed:', ocrErr);
+                    notifyAribaTab(tabId, `Local image OCR failed for "${realFilename}": ${ocrErr.message}`, true);
                     compiledTextList.push({
                       filename: realFilename,
-                      text: `[OCR_FAILED] Remote OCR failed: ${ocrErr.message}`
+                      text: `[OCR_FAILED] Local image OCR failed: ${ocrErr.message}`
                     });
                   }
                 } else {
@@ -1494,7 +1448,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const compiledDataUrl = `data:text/plain;charset=utf-8;base64,${base64Compiled}`;
 
             const compiledFilename = `${s} - Extracted_Data.txt`;
-             if (uploadEnabled) {
+            if (uploadEnabled) {
               filesForGemini.push({
                 filename: compiledFilename,
                 dataUrl: compiledDataUrl,
@@ -1556,7 +1510,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
             const qaFilename = `${s} - QA_Data.md`;
 
-             if (uploadEnabled) {
+            if (uploadEnabled) {
               filesForGemini.push({
                 filename: qaFilename,
                 dataUrl: dataUrl,
@@ -1657,17 +1611,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // Clear any stale session state so the next run starts clean
         if (supplierKey) clearState(supplierKey).catch(() => { });
       } finally {
+        const tabId = sender.tab?.id;
+        if (tabId) chrome.tabs.sendMessage(tabId, { action: 'hideOverlay' }).catch(() => { });
         clearTimeout(timeoutHandle);
         clearStopSignal();
         // Clear the run config so onUpdateAvailable doesn't see a stale
         // 'uploadConfig' and wrongly treat it as an active job on the
         // next update check (e.g. if Chrome was closed mid-run last time).
         chrome.storage.session.remove('uploadConfig').catch(() => { });
-
       }
     }
+  };
 
-  })();
+  // Always return true to keep the service worker alive for ALL async
+  // handlers (downloadFiles, stopAutomation, etc.). The "message channel
+  // closed" warning that Chrome logs is harmless — it just means some
+  // handlers don't call sendResponse, which is fine for fire-and-forget
+  // actions like downloadFiles.
+  handleMessage();
   return true;
 });
 
@@ -1676,7 +1637,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // code programmatically every time a NotebookLM tab loads.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete' && tab.url && tab.url.includes('notebooklm.google.com')) {
-    
+
     // Inject CSS
     chrome.scripting.insertCSS({
       target: { tabId },
@@ -1710,13 +1671,13 @@ const activeRequestLogs = {};
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
-  
+
   if (method === 'Network.requestWillBeSent') {
     const url = params.request.url;
-    const isUploadRequest = url.includes('clients6.google.com') || 
-                            url.includes('push.clients6.google.com') ||
-                            url.includes('BardChatUi/data/batchexecute');
-    
+    const isUploadRequest = url.includes('clients6.google.com') ||
+      url.includes('push.clients6.google.com') ||
+      url.includes('BardChatUi/data/batchexecute');
+
     if (isUploadRequest) {
       if (!activeRequestLogs[tabId]) {
         activeRequestLogs[tabId] = {};
@@ -1752,7 +1713,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           chrome.runtime.sendMessage({
             action: 'logNetworkData',
             logData: JSON.stringify(logData, null, 2)
-          }).catch(() => {});
+          }).catch(() => { });
 
           // Clean up this request
           if (activeRequestLogs[source.tabId]) {

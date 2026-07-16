@@ -1,2 +1,5 @@
 System Instruction.pdf
 Simplified_System_Instruction.md
+node_modules/
+package-lock.json
+package.json

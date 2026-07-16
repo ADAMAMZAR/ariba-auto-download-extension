@@ -105,41 +105,7 @@
     };
   }
 
-  // ── Intercept document.createElement('input') to capture dynamic file inputs ──
-  if (!window.__aribaElementCreateIntercepted) {
-    window.__aribaElementCreateIntercepted = true;
-    const originalCreateElement = document.createElement;
-    document.createElement = function (tagName, options) {
-      const el = originalCreateElement.apply(this, arguments);
-      if (tagName && tagName.toLowerCase() === 'input') {
-        let typeVal = el.type;
-        Object.defineProperty(el, 'type', {
-          get() {
-            return typeVal;
-          },
-          set(val) {
-            typeVal = val;
-            el.setAttribute('type', val);
-            if (val === 'file') {
-              console.log('[Ariba Ext] Captured dynamically created file input:', el);
-              window.__aribaCapturedFileInput = el;
-
-              el.addEventListener('click', (e) => {
-                if (window.__aribaAutomatingUpload) {
-                  console.log('[Ariba Ext] Intercepted upload click, preventing OS file dialog');
-                  e.preventDefault();
-                  e.stopPropagation();
-                }
-              }, { capture: true });
-            }
-          },
-          configurable: true
-        });
-      }
-      return el;
-    };
-  }
-
+  // ── No element interception needed for Paste method ──
   // ── Helpers ──────────────────────────────────────────────────────────
 
   /** Relay a status message to the panel via the isolated-world message bridge. */
@@ -209,70 +175,8 @@
     return;
   }
 
-  // ── Step 2: Open upload menu and trigger file input creation ──────────
-  sendStatus('Opening Upload & Tools menu...');
-  const findUploadToolsButton = () => {
-    let btn = document.querySelector('button[aria-label="Upload & tools"]') ||
-      document.querySelector('button[aria-label*="Upload"]') ||
-      document.querySelector('button[aria-label*="upload"]');
-    if (btn) return btn;
-    const plusIcon = document.querySelector('mat-icon[fonticon="plus"]') ||
-      document.querySelector('mat-icon[data-mat-icon-name="plus"]');
-    if (plusIcon) {
-      let parent = plusIcon.parentElement;
-      while (parent && parent !== document.body) {
-        if (parent.tagName === 'BUTTON') return parent;
-        parent = parent.parentElement;
-      }
-    }
-    return null;
-  };
-
-  const uploadToolsBtn = findUploadToolsButton();
-  if (uploadToolsBtn) {
-    uploadToolsBtn.click();
-    await wait(1000); // Wait for menu to open and render
-  } else {
-    sendStatus('Warning: Upload & tools button not found.');
-  }
-
-  // Set automating flag to prevent native file chooser dialog from opening
-  window.__aribaAutomatingUpload = true;
-
-  // Locate the Files uploader trigger button and click it to instantiate/trigger the input
-  const findTriggerButton = () => {
-    return document.querySelector('[data-test-id="local-images-files-uploader-button"]') ||
-      document.querySelector('.hidden-local-file-image-selector-button') ||
-      document.querySelector('[data-test-id="uploader-images-files-button-advanced"] button') ||
-      document.querySelector('images-files-uploader button') ||
-      Array.from(document.querySelectorAll('button, [role="menuitem"]')).find(el => {
-        const txt = (el.textContent || '').trim().toLowerCase();
-        return txt.includes('upload files') || txt === 'files';
-      });
-  };
-
-  const triggerBtn = findTriggerButton();
-
-  if (triggerBtn) {
-    sendStatus('Triggering file input creation...');
-    triggerBtn.click();
-    await wait(1000);
-  } else {
-    sendStatus('Warning: Files trigger button not found.');
-  }
-
-  // ── Step 3: Retrieve the captured file input element ────────────────
-  const fileInput = window.__aribaCapturedFileInput || document.querySelector('input[type="file"]');
-
-  if (!fileInput) {
-    sendStatus('Could not locate file upload input element.', true, true);
-    window.__aribaAutomatingUpload = false;
-    return;
-  }
-
-  sendStatus('Found file input. Loading files...');
-
-  // ── Step 4: Convert data URLs to File objects and upload ─────────────
+  // ── Step 2: Inject Files directly via Clipboard Paste ──
+  sendStatus('Attaching files via direct Paste simulation...');
   try {
     const dt = new DataTransfer();
     for (const file of filesToUpload) {
@@ -295,18 +199,24 @@
       dt.items.add(fileObj);
     }
 
-    fileInput.files = dt.files;
-    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-    sendStatus('Files attached successfully. Upload in progress...');
+    editor.focus();
+    
+    // Dispatch a highly synthetic paste event directly onto the editor
+    // ProseMirror (Gemini's editor) listens for this and natively uploads the files!
+    const pasteEvent = new ClipboardEvent('paste', {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: dt
+    });
+    
+    editor.dispatchEvent(pasteEvent);
+    
+    sendStatus('Files pasted successfully! Upload in progress...');
+    await wait(2000); // Wait for UI to register the pasted files
   } catch (err) {
     sendStatus('Failed to load files into Gemini: ' + err.message, true, true);
-    window.__aribaAutomatingUpload = false;
     return;
   }
-
-  // Restore normal click behavior for user
-  window.__aribaAutomatingUpload = false;
-  await wait(1000);
 
   // ── Step 5: Enter the prompt text ───────────────────────────────────
   sendStatus('Typing prompt...');
@@ -333,12 +243,19 @@
     return;
   }
 
-  // Wait for the upload sequence to start and the Send button to become disabled during transfer
-  sendStatus('Waiting 5 seconds for file upload to initialize...');
-  await wait(5000);
-
-  // ── Step 6: Wait for the upload to complete and submit ──────────────
+  // Wait for the upload sequence to start (Send button becomes disabled)
+  sendStatus('Waiting for file upload to initialize...');
+  
+  // We need to find the send button first so we can monitor its state
   const findSendButton = () => {
+    const isStopBtn = (el) => {
+      if (!el) return false;
+      if (el.classList && el.classList.contains('stop')) return true;
+      if (el.closest && el.closest('.stop')) return true;
+      const label = (el.getAttribute('aria-label') || el.title || el.textContent || '').toLowerCase();
+      return label.includes('stop');
+    };
+
     const selectors = [
       'gem-icon-button.send-button button',
       'button[aria-label="Send message"]',
@@ -353,15 +270,13 @@
     ];
     for (const sel of selectors) {
       const btn = document.querySelector(sel);
-      if (btn) return btn;
+      if (btn && !isStopBtn(btn)) return btn;
     }
-    // Fallback: search all buttons
     const buttons = document.querySelectorAll('button');
     for (const btn of buttons) {
+      if (isStopBtn(btn)) continue;
       const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || '').toLowerCase();
-      if (label.includes('send') || label.includes('submit') || label.includes('run')) {
-        return btn;
-      }
+      if (label.includes('send') || label.includes('submit') || label.includes('run')) return btn;
     }
     return null;
   };
@@ -374,18 +289,55 @@
     return true;
   };
 
-  sendStatus('Waiting for upload to finish...');
+  // Poll every 100ms until the send button is disabled (indicating upload has begun)
+  for (let i = 0; i < 50; i++) { 
+    const btn = findSendButton();
+    if (btn && !isButtonEnabled(btn)) break;
+    await wait(100);
+  }
+
+  // ── Step 6: Wait for the upload to complete and submit ──────────────
+  // In a background tab, the UI framework (Angular/React) may suspend rendering,
+  // meaning the Send button never visually updates to "enabled" until focused.
+  // To bypass this, we aggressively attempt to submit every 2 seconds until
+  // we detect that generation has started (Stop button appears).
+
+  sendStatus('Waiting for upload to finish and submitting prompt in background...');
 
   let sendButton = null;
   const maxWaitMs = 90000; // 90 seconds timeout
-  const intervalMs = 500;
+  const intervalMs = 2000; // 2s (background tabs throttle to 1s anyway)
   let elapsedMs = 0;
+  let generationStarted = false;
 
   while (elapsedMs < maxWaitMs) {
     sendButton = findSendButton();
-    if (sendButton && isButtonEnabled(sendButton)) {
+    
+    if (sendButton) {
+      // Force remove disabled attributes so native click events aren't blocked by the browser
+      sendButton.removeAttribute('disabled');
+      sendButton.removeAttribute('aria-disabled');
+      sendButton.classList.remove('lm-disabled');
+      
+      // Dispatch a click on the button
+      sendButton.click();
+    }
+    
+    if (editor) {
+      // Also dispatch Enter on the editor as a fallback
+      editor.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13
+      }));
+    }
+
+    // Check if it successfully sent (Stop button appeared)
+    const stopBtn = document.querySelector('button[aria-label="Stop response"], gem-icon-button.stop, gem-icon-button.send-button.stop');
+    
+    if (stopBtn) {
+      generationStarted = true;
       break;
     }
+
     await wait(intervalMs);
     elapsedMs += intervalMs;
   }
@@ -511,26 +463,8 @@
     }
   }
 
-  if (sendButton && isButtonEnabled(sendButton)) {
-    sendStatus('Files uploaded completely. Sending prompt...');
-    await wait(1000); // 1s visual buffer
-    sendButton.click();
-
-    sendStatus('Prompt submitted. Waiting for response generation to start...');
-
-    // Wait for response generation to start (either stop button appears or send button is disabled)
-    let generationStarted = false;
-    for (let i = 0; i < 15; i++) { // wait up to 7.5 seconds
-      const stopBtn = document.querySelector('button[aria-label="Stop response"], gem-icon-button.stop, gem-icon-button.send-button.stop');
-      const sendBtn = findSendButton();
-      if (stopBtn || (sendBtn && !isButtonEnabled(sendBtn))) {
-        generationStarted = true;
-        break;
-      }
-      await wait(500);
-    }
-
-    sendStatus('Waiting for response generation to complete...');
+  if (generationStarted) {
+    sendStatus('Prompt submitted successfully! Waiting for response generation to complete...');
 
     // Wait for generation to finish (stop button disappears from the DOM)
     const maxGenWait = 90000; // 90s max wait for audit completion
