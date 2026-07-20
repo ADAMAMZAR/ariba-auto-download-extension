@@ -126,7 +126,44 @@
     }, '*');
   };
 
-  const wait = ms => new Promise(r => setTimeout(r, ms));
+  // Human-like sleep with random jitter (±25% variation) to make timing irregular
+  const wait = ms => {
+    const jitter = (Math.random() * 0.5 - 0.25) * ms;
+    const finalMs = Math.max(50, ms + jitter);
+    return new Promise(r => setTimeout(r, finalMs));
+  };
+
+  // Helper to simulate realistic human click
+  const simulateClick = async (el) => {
+    if (!el) return;
+    try {
+      const rect = el.getBoundingClientRect();
+      // Click near the center but with a slight random offset to avoid exact coordinate tracking
+      const x = rect.left + rect.width / 2 + (Math.random() * 8 - 4);
+      const y = rect.top + rect.height / 2 + (Math.random() * 8 - 4);
+
+      // Human-like cursor entry & hover sequence
+      el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+      el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+      el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+      
+      // Pause briefly as a user moves their mouse over the button before pressing
+      await new Promise(r => setTimeout(r, 150 + Math.random() * 150));
+
+      // Human mousedown
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, buttons: 1 }));
+      
+      // Hold the click briefly (typical click duration: 70ms - 130ms)
+      await new Promise(r => setTimeout(r, 70 + Math.random() * 60));
+
+      // Human mouseup & click
+      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, buttons: 1 }));
+      el.click();
+    } catch (e) {
+      console.warn('[Ariba Ext] simulateClick failed, falling back to standard click():', e);
+      el.click();
+    }
+  };
 
   let supplierName = 'Supplier';
 
@@ -153,7 +190,7 @@
 
     if (landingBtn) {
       sendStatus('Found landing button. Clicking to open the Gem chat...');
-      landingBtn.click();
+      await simulateClick(landingBtn);
       await wait(2000); // Wait for transition and elements to load
       break;
     }
@@ -234,9 +271,21 @@
     const fileNames = filesToUpload.map(f => `"${f.filename}"`).join(', ');
     const promptText = `Analyze the following supplier documents: ${fileNames}. \n\n(CRITICAL: Do not output any internal reasoning or step-by-step logic. Output only the final formatted answer.)`;
 
-    // Simulate keyboard text insertion to update internal state (ProseMirror)
-    document.execCommand('insertText', false, promptText);
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    // Simulate realistic character-by-character typing to trigger key events and natural delays
+    for (let i = 0; i < promptText.length; i++) {
+      const char = promptText[i];
+      document.execCommand('insertText', false, char);
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+      // Natural delays between keystrokes (average typing speed: ~40-50ms per character)
+      let delay = 15 + Math.random() * 30;
+      if (char === ' ' || char === '\n') {
+        delay = 100 + Math.random() * 150; // pause briefly on spaces and newlines
+      } else if (['.', ',', '!', ':', ';'].includes(char)) {
+        delay = 250 + Math.random() * 250; // longer punctuation pause
+      }
+      await new Promise(r => setTimeout(r, delay));
+    }
     sendStatus('Prompt entered successfully.');
   } catch (err) {
     sendStatus('Failed to write prompt: ' + err.message, true, true);
@@ -256,6 +305,10 @@
       return label.includes('stop');
     };
 
+    // Scope to the input container relative to the editor to avoid finding random buttons (like "Submit Feedback" or "Run Code") on the page.
+    const inputContainer = editor ? (editor.closest('form') || editor.closest('.input-area') || editor.closest('.chat-input-container') || editor.parentElement?.parentElement) : null;
+    const root = inputContainer || document;
+
     const selectors = [
       'gem-icon-button.send-button button',
       'button[aria-label="Send message"]',
@@ -264,19 +317,17 @@
       'button[aria-label*="Send"]',
       'button[aria-label*="send"]',
       'button[aria-label*="Submit"]',
-      'button[aria-label*="submit"]',
-      'button[aria-label*="Run"]',
-      'button[aria-label*="run"]'
+      'button[aria-label*="submit"]'
     ];
     for (const sel of selectors) {
-      const btn = document.querySelector(sel);
+      const btn = root.querySelector(sel);
       if (btn && !isStopBtn(btn)) return btn;
     }
-    const buttons = document.querySelectorAll('button');
+    const buttons = root.querySelectorAll('button');
     for (const btn of buttons) {
       if (isStopBtn(btn)) continue;
       const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || '').toLowerCase();
-      if (label.includes('send') || label.includes('submit') || label.includes('run')) return btn;
+      if (label.includes('send') || label.includes('submit')) return btn;
     }
     return null;
   };
@@ -311,6 +362,13 @@
   let generationStarted = false;
 
   while (elapsedMs < maxWaitMs) {
+    // If the editor has been cleared, the framework successfully submitted/cleared the message.
+    // We break early to avoid clicking other buttons or sending empty messages.
+    if (editor && editor.textContent.trim() === '') {
+      generationStarted = true;
+      break;
+    }
+
     sendButton = findSendButton();
     
     if (sendButton) {
@@ -319,8 +377,8 @@
       sendButton.removeAttribute('aria-disabled');
       sendButton.classList.remove('lm-disabled');
       
-      // Dispatch a click on the button
-      sendButton.click();
+      // Dispatch a realistic human click on the button
+      await simulateClick(sendButton);
     }
     
     if (editor) {

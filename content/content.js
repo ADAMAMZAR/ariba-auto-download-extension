@@ -209,10 +209,14 @@
       if (message.action === 'hideToasts') {
         const c = document.getElementById('ariba-toast-container');
         if (c) c.style.visibility = 'hidden';
+        const o = document.getElementById('ariba-loading-overlay');
+        if (o) o.style.display = 'none';
       }
       if (message.action === 'showToasts') {
         const c = document.getElementById('ariba-toast-container');
         if (c) c.style.visibility = '';
+        const o = document.getElementById('ariba-loading-overlay');
+        if (o) o.style.display = 'flex';
       }
       if (message.action === 'hideOverlay') {
         hideOverlay();
